@@ -139,7 +139,7 @@ async function spørgClaude(indhold, brugWebsøgning) {
   if (brugWebsøgning) {
     body.tools = [{ type: "web_search_20250305", name: "web_search" }];
   }
-  const svar = await fetch("https:///.netlify/functions/ai/v1/messages", {
+  const svar = await fetch("https:///.netlify/functions/ai", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
