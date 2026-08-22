@@ -91,6 +91,21 @@ async function hentYouTubeInfo(url) {
   }
 }
 
+/* Henter en offentlig side via Netlify-funktionen. Findes funktionen ikke
+   — fx når appen køres som artifact — returneres null, og alt virker som før. */
+async function hentSideTekst(url) {
+  try {
+    const svar = await fetch(
+      `/.netlify/functions/hent-side?url=${encodeURIComponent(url)}`
+    );
+    if (!svar.ok) return null;
+    const d = await svar.json();
+    return d && d.tekst && d.tekst.length > 200 ? d : null;
+  } catch {
+    return null;
+  }
+}
+
 function læsSomBase64(fil) {
   return new Promise((klar, fejl) => {
     const læser = new FileReader();
@@ -115,17 +130,16 @@ function udtrækJson(tekst) {
   }
 }
 
-/* ------------------------------------------------------------------ */
-/*  AI-kald — går nu via jeres egen Netlify-funktion (server-side       */
-/*  nøgle) i stedet for Claudes indbyggede, nøglefri adgang.            */
-/* ------------------------------------------------------------------ */
-
 async function spørgClaude(indhold, brugWebsøgning) {
-  const body = { messages: [{ role: "user", content: indhold }] };
+  const body = {
+    model: "claude-sonnet-4-6",
+    max_tokens: 1000,
+    messages: [{ role: "user", content: indhold }],
+  };
   if (brugWebsøgning) {
     body.tools = [{ type: "web_search_20250305", name: "web_search" }];
   }
-  const svar = await fetch("/.netlify/functions/ask-claude", {
+  const svar = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -139,24 +153,15 @@ async function spørgClaude(indhold, brugWebsøgning) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Delt lagring — går nu via jeres egen Netlify-funktion (Netlify       */
-/*  Blobs) i stedet for artifact-versionens window.storage.             */
+/*  Delt lagring                                                       */
 /* ------------------------------------------------------------------ */
-
-async function storageKald(action, params) {
-  const svar = await fetch("/.netlify/functions/storage", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ action, ...params }),
-  });
-  return svar.json();
-}
 
 let hukommelse = { opslag: [], navne: STANDARDNAVNE };
 
 async function hentData() {
+  if (!storage) return hukommelse;
   try {
-    const r = await storageKald("get", { key: NOEGLE });
+    const r = await storage.get(NOEGLE, true);
     if (r && r.value) {
       const d = JSON.parse(r.value);
       return {
@@ -165,7 +170,7 @@ async function hentData() {
       };
     }
   } catch {
-    /* nøglen findes ikke endnu, eller kaldet fejlede */
+    /* nøglen findes ikke endnu */
   }
   return { opslag: [], navne: STANDARDNAVNE };
 }
@@ -174,10 +179,8 @@ async function gemData(opdater) {
   const nuværende = await hentData();
   const næste = opdater(nuværende);
   hukommelse = næste;
-  try {
-    await storageKald("set", { key: NOEGLE, value: JSON.stringify(næste) });
-  } catch {
-    /* ændringen er stadig vist i denne fane, selvom gemningen fejlede */
+  if (storage) {
+    await storage.set(NOEGLE, JSON.stringify(næste), true);
   }
   return næste;
 }
@@ -610,13 +613,20 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
     if (!navn) return setFejl("Vælg dit navn på listen.");
     setArbejder(true);
 
-    const tekstKilde = transskription.trim().slice(0, 12000);
+    let tekstKilde = transskription.trim().slice(0, 12000);
     const yt = await hentYouTubeInfo(url.trim());
+
+    /* Er der hverken fil eller indsat tekst, så prøv at hente siden på serveren */
+    let side = null;
+    if (!fil && !tekstKilde && !BAG_LOGIN.test(url)) {
+      side = await hentSideTekst(url.trim());
+      if (side) tekstKilde = side.tekst.slice(0, 12000);
+    }
 
     const kilde = fil
       ? `Kollegaen har vedhæftet selve filen (${fil.name}). Byg titel, fagområde og opsummering på filens faktiske indhold.`
       : tekstKilde
-      ? `Kollegaen har indsat tekst fra kilden nedenfor. Byg opsummeringen på den tekst — det er dit primære grundlag. Søg ikke.`
+      ? `Nedenfor står teksten fra kilden. Byg opsummeringen på den — det er dit primære grundlag. Søg ikke. Teksten er hentet råt fra en webside, så se bort fra menupunkter, cookiebeskeder, kontaktoplysninger og gentagelser.`
       : `Slå linket op på nettet, hvis siden er offentligt tilgængelig. Søg højst én gang. Kan du ikke komme ind — fordi siden kræver login, eller fordi indholdet er en video eller podcast, du hverken kan se eller høre — så find aldrig på indhold. Skriv i stedet en opsummering, der bygger på kollegaens note, og indled den med "Kunne ikke læses automatisk."`;
 
     const opgave = `Du hjælper undervisere på Markedsføringsøkonom-uddannelsen på et dansk erhvervsakademi med at katalogisere delt viden.
@@ -624,12 +634,14 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
 Link: ${url.trim()}${
       yt
         ? `\nKildens rigtige titel: "${yt.titel}"${yt.kanal ? ` (kanal: ${yt.kanal})` : ""}`
+        : side && side.titel
+        ? `\nSidens egen titel: "${side.titel}"`
         : ""
     }
 Kollegaens egen note: ${note.trim() || "(ingen)"}
 
 ${kilde}
-${tekstKilde ? `\nIndsat tekst fra kilden:\n"""\n${tekstKilde}\n"""\n` : ""}
+${tekstKilde ? `\nTekst fra kilden:\n"""\n${tekstKilde}\n"""\n` : ""}
 Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen markdown:
 {"titel":"kort sigende titel på dansk, max 12 ord","kategori":"et af: ${FAGLISTE}","type":"et af: Dokument, Podcast, Video","opsummering":"2-3 sætninger på dansk i almindeligt sprog, der fortæller en underviser hvad det handler om, og hvad det kan bruges til"}`;
 
@@ -659,7 +671,7 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
       }
       j = j || {};
       setUdkast({
-        titel: j.titel || (yt && yt.titel) || pænUrl(url),
+        titel: j.titel || (yt && yt.titel) || (side && side.titel) || pænUrl(url),
         kategori: FAGOMRAADER.some((f) => f.navn === j.kategori)
           ? j.kategori
           : "Markedsføring",
@@ -898,7 +910,7 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
                 ? "Læser den vedhæftede fil…"
                 : transskription.trim()
                 ? "Læser den indsatte tekst…"
-                : "Slår linket op og skriver opsummering…"
+                : "Henter siden og skriver opsummering…"
             }
           />
         ) : (
