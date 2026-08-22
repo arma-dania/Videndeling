@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-
+import { storage } from "./lager.js";
 /* ------------------------------------------------------------------ */
 /*  Data og konstanter                                                 */
 /* ------------------------------------------------------------------ */
