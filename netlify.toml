@@ -1,0 +1,12 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+# Netlify sætter ikke selv en X-Frame-Options/CSP-header, så siden kan som
+# udgangspunkt vises i en Teams-fane uden ekstra opsætning. Tilføj IKKE en
+# X-Frame-Options-header her, medmindre I bevidst vil begrænse hvor den må
+# vises indlejret.
