@@ -248,7 +248,7 @@ const STIL = `
 .vd-tab { font-size:14px; padding:5px 12px; border-radius:999px; color:var(--graa);
   border:1px solid transparent; }
 .vd-tab:hover { color:var(--blaek); }
-.vd-tab[aria-pressed="true"] { background:var(--blaek); color:#fff; }
+.vd-tab[aria-pressed="true"] { background:var(--rod); color:#fff; }
 .vd-retning { margin-left:6px; font-size:12px; opacity:.85; }
 .vd-filter { font-size:13.5px; padding:5px 12px; border-radius:999px;
   border:1px solid var(--linje); display:inline-flex; align-items:center; gap:7px; }
