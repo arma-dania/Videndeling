@@ -117,12 +117,12 @@ function filformat(url) {
   return endelse ? ENDELSER[endelse[1].toLowerCase()] || "" : "";
 }
 
-/* Teksten på kortets knap, fx "Åbn PowerPoint i Teams" */
+/* Teksten på kortets knap, fx "Åbn PowerPoint i Teams" eller "Åbn dr.dk" */
 function åbnTekst(url) {
   const format = filformat(url);
   const navn = { Video: "videoen", Mappe: "mappen", Billede: "billedet", Lyd: "lydfilen" }[format] || format;
   if (ER_M365.test(url)) return navn ? `Åbn ${navn} i Teams` : "Åbn i Teams";
-  return navn ? `Åbn ${navn}` : "Åbn";
+  return navn ? `Åbn ${navn}` : `Åbn ${pænUrl(url)}`;
 }
 
 /* Teksten på en links knap: linkets eget navn, hvis det har et, ellers filtypen */
@@ -130,11 +130,6 @@ function knapTekst(link) {
   if (!link.navn) return åbnTekst(link.url);
   return `Åbn ${link.navn}${ER_M365.test(link.url) ? " i Teams" : ""}`;
 }
-
-/* Teams-links (teams.microsoft.com/l/…) åbner i browseren. Med msteams:
-   i stedet for https://teams.microsoft.com åbner de i Teams-appen. */
-const ER_TEAMS_LINK = /^https:\/\/teams\.microsoft\.com\/l\//i;
-const tilTeamsAppen = (url) => url.replace(/^https:\/\/teams\.microsoft\.com\//i, "msteams:/");
 
 /* Et opslag kan have flere links, fx slides og optagelse. De ligger i
    "links"; "url" er altid det første, så ældre opslag og søgning virker. */
@@ -195,12 +190,15 @@ async function hentSideTekst(url) {
 /*  Læsning af vedhæftede filer                                        */
 /* ------------------------------------------------------------------ */
 
-/* En Netlify-funktion tager højst ca. 6 MB ind. Større PDF'er og alle
-   PowerPoint- og Word-filer læses derfor her i browseren, og kun teksten
-   sendes videre. Filen selv gemmes ingen steder — den bliver i Teams. */
+/* En Netlify-funktion tager højst ca. 6 MB ind og skal svare inden for 30
+   sekunder. PDF'er, PowerPoint- og Word-filer læses derfor her i browseren,
+   og kun teksten sendes videre. Filen selv gemmes ingen steder — den bliver
+   i Teams. */
 const MAKS_DIREKTE = 3.5 * 1024 * 1024;
-const MAKS_TEKST = 15000;
-const MAKS_SAMLET = 30000; // tekst fra flere filer tilsammen
+// Ca. 30.000 ord i alt — nok til en hel konference, og AI'en når at læse det
+const MAKS_SAMLET = 120000;
+const MAKS_SIDE = 10000; // tekst fra én webside
+const MAKS_INDSAT = 30000; // tekst, kollegaen selv har indsat
 
 const ER_PPTX = /\.pptx$/i;
 const ER_DOCX = /\.docx$/i;
@@ -216,12 +214,32 @@ function tekstFraXml(xml) {
     .join("\n");
 }
 
-async function udtrækOffice(fil) {
+/* Samler dele (dias eller sider) under et loft. Er der for meget, forkortes
+   hver del lige meget i stedet for at skære slutningen af — ellers ville de
+   sidste oplæg i en lang præsentation aldrig komme med. Korte dele beholdes
+   hele og giver deres overskud videre til de lange. */
+function tilpas(dele, loft) {
+  const samlet = dele.reduce((sum, d) => sum + d.length, 0);
+  if (samlet <= loft) return dele.join("\n\n");
+  const plads = [];
+  let rest = loft;
+  let tilbage = dele.length;
+  for (const [længde, i] of dele.map((d, i) => [d.length, i]).sort((a, b) => a[0] - b[0])) {
+    plads[i] = Math.min(længde, Math.floor(rest / tilbage));
+    rest -= plads[i];
+    tilbage--;
+  }
+  return dele.map((d, i) => (d.length > plads[i] ? `${d.slice(0, plads[i])}…` : d)).join("\n\n");
+}
+
+async function udtrækOffice(fil, loft) {
   const { default: JSZip } = await import("jszip");
   const zip = await JSZip.loadAsync(fil);
   const læs = (navn) => (zip.file(navn) ? zip.file(navn).async("string") : "");
 
-  if (ER_DOCX.test(fil.name)) return tekstFraXml(await læs("word/document.xml"));
+  if (ER_DOCX.test(fil.name)) {
+    return tilpas([tekstFraXml(await læs("word/document.xml"))], loft);
+  }
 
   // PowerPoint: diasene i rækkefølge, med talernoter hvor de findes
   const nr = (navn) => Number((navn.match(/(\d+)\.xml$/) || [])[1] || 0);
@@ -237,33 +255,40 @@ async function udtrækOffice(fil) {
     if (tekst || noter) {
       dele.push(`Dias ${i + 1}:\n${tekst}${noter ? `\nNoter: ${noter}` : ""}`);
     }
-    if (dele.join("").length > MAKS_TEKST) break;
   }
-  return dele.join("\n\n");
+  return tilpas(dele, loft);
 }
 
-async function udtrækPdf(fil) {
+async function udtrækPdf(fil, loft) {
   const pdfjs = await import("pdfjs-dist");
   const { default: arbejder } = await import("pdfjs-dist/build/pdf.worker.min.mjs?url");
   pdfjs.GlobalWorkerOptions.workerSrc = arbejder;
   const pdf = await pdfjs.getDocument({ data: await fil.arrayBuffer() }).promise;
-  const sider = [];
+  const dele = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const indhold = await (await pdf.getPage(i)).getTextContent();
-    sider.push(indhold.items.map((x) => x.str).join(" "));
-    if (sider.join("").length > MAKS_TEKST) break;
+    const tekst = indhold.items
+      .map((x) => x.str)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (tekst) dele.push(`Side ${i}: ${tekst}`);
   }
-  return sider.join("\n");
+  return tilpas(dele, loft);
 }
 
 /* Svarer enten { tekst } (udtrukket her) eller { blok } (sendes som fil til AI'en).
-   "plads" er, hvor meget der er tilbage af de ca. 3,5 MB, der kan sendes som fil. */
-async function læsFil(fil, plads = MAKS_DIREKTE) {
+   "plads" er, hvor meget der er tilbage af de ca. 3,5 MB, der kan sendes som
+   fil, og "loft" er, hvor mange tegn teksten fra denne fil må fylde. */
+async function læsFil(fil, plads, loft) {
   if (ER_PPTX.test(fil.name) || ER_DOCX.test(fil.name)) {
-    return { tekst: (await udtrækOffice(fil)).slice(0, MAKS_TEKST) };
+    return { tekst: await udtrækOffice(fil, loft) };
   }
   if (fil.type === "application/pdf") {
-    if (fil.size > plads) return { tekst: (await udtrækPdf(fil)).slice(0, MAKS_TEKST) };
+    // Teksten er hurtigere og billigere for AI'en end selve PDF'en. Kun en
+    // scannet PDF uden tekst sendes som fil, så AI'en kan se siderne.
+    const tekst = await udtrækPdf(fil, loft);
+    if (tekst.length > 200 || fil.size > plads) return { tekst };
     const data = await læsSomBase64(fil);
     return { blok: { type: "document", source: { type: "base64", media_type: fil.type, data } } };
   }
@@ -314,7 +339,10 @@ async function spørgClaude(indhold, brugWebsøgning) {
     // Gem serverens egen forklaring, fx at API-nøglen mangler, så den kan vises
     const fejl = new Error(`AI-fejl ${svar.status}`);
     fejl.detalje =
-      (data && (data.fejl || (data.error && data.error.message))) || `status ${svar.status}`;
+      (data && (data.fejl || (data.error && data.error.message))) ||
+      (svar.status === 502 || svar.status === 504
+        ? "AI'en nåede ikke at blive færdig inden for tidsgrænsen på 30 sekunder. Prøv igen, eller vedhæft færre filer"
+        : `status ${svar.status}`);
     throw fejl;
   }
   if (!data || !Array.isArray(data.content)) throw new Error("Uventet svar");
@@ -394,15 +422,6 @@ async function hentData() {
 }
 
 const gemOpslag = (post) => storage.set(PRAEFIKS_OPSLAG + post.id, JSON.stringify(post));
-
-async function gemNavn(navn) {
-  const navne = (await hentNøgle(NOEGLE_NAVNE)) || STANDARDNAVNE;
-  const næste = navne.includes(navn)
-    ? navne
-    : [...navne, navn].sort((a, b) => a.localeCompare(b, "da"));
-  await storage.set(NOEGLE_NAVNE, JSON.stringify(næste));
-  return næste;
-}
 
 /* Browseren husker, hvem man er, så navnet er valgt på forhånd næste gang */
 const MIT_NAVN = "vidensdeling:mitnavn";
@@ -529,7 +548,7 @@ const STIL = `
 .vd-titel a { color:inherit; text-decoration:none; background-image:linear-gradient(currentColor,currentColor);
   background-size:0% 1.5px; background-repeat:no-repeat; background-position:0 100%; transition:background-size .2s; }
 .vd-titel a:hover { background-size:100% 1.5px; }
-.vd-resume { color:#40383D; font-size:14.5px; margin:0; }
+.vd-resume { color:#40383D; font-size:14.5px; margin:0; white-space:pre-line; }
 .vd-resume.vd-klip { display:-webkit-box; -webkit-line-clamp:5; -webkit-box-orient:vertical; overflow:hidden; }
 .vd-fold { display:flex; align-items:center; justify-content:center; width:100%;
   margin-top:9px; padding:9px 0 5px; border-top:1px solid var(--linje); color:var(--graa); }
@@ -588,9 +607,20 @@ textarea.vd-lang { min-height:150px; font-size:14px; }
   background:var(--rod-lys); color:var(--rod-dyb); font-size:13.5px; font-weight:600; text-decoration:none; }
 .vd-aabn:hover { background:#F6DDE1; }
 .vd-links { display:flex; flex-wrap:wrap; gap:8px 10px; align-items:center; margin-top:12px; }
-.vd-teamslink { display:inline-flex; align-items:baseline; gap:8px; }
-.vd-browser { font-size:12px; color:var(--graa); text-decoration:underline; text-underline-offset:3px; }
-.vd-browser:hover { color:var(--rod); }
+.vd-nyfane { font-size:13px; color:var(--graa); }
+.vd-voksende { resize:vertical; overflow:hidden; min-height:120px; }
+.vd-trin { display:flex; gap:16px; padding:22px 0; border-top:1px solid var(--linje); }
+.vd-trin:first-of-type { border-top:none; padding-top:6px; }
+.vd-trinnr { flex:none; width:34px; height:34px; border-radius:50%; background:var(--rod); color:#fff;
+  display:flex; align-items:center; justify-content:center; font-weight:700; font-size:16px;
+  font-family:"Bricolage Grotesque",system-ui,sans-serif; }
+.vd-trinindhold { flex:1; min-width:0; }
+.vd-trinnr-inline { display:inline-flex; vertical-align:middle; margin-right:8px; position:relative; top:-3px; }
+.vd-trintitel { font-family:"Bricolage Grotesque",system-ui,sans-serif; font-weight:600; font-size:18px;
+  letter-spacing:-0.01em; margin:5px 0 14px; }
+.vd-trinindhold > .vd-mark:last-child, .vd-trinindhold > .vd-todelt:last-child .vd-mark { margin-bottom:0; }
+.vd-tip ol { margin:6px 0 0; padding-left:20px; }
+.vd-tip li { margin:3px 0; }
 .vd-linkrække { display:flex; gap:8px; margin-bottom:8px; }
 .vd-linkurl { flex:2 1 0; min-width:0; }
 .vd-linknavn { flex:1 1 0; min-width:0; }
@@ -675,25 +705,37 @@ function Pil() {
   );
 }
 
-/* Et link, der åbner i Teams-appen, hvis det er et Teams-link — med en lille
-   reserve til browseren, fx på en computer uden appen */
-function TeamsLink({ url, className, children }) {
-  if (!ER_TEAMS_LINK.test(url)) {
-    return (
-      <a className={className} href={url} target="_blank" rel="noopener noreferrer">
-        {children}
-      </a>
-    );
-  }
+/* Tekstfelt, der vokser med teksten, så hele opsummeringen kan ses */
+function VoksendeTekst({ value, onChange, className = "vd-input" }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${el.scrollHeight + 4}px`;
+  }, [value]);
   return (
-    <span className="vd-teamslink">
-      <a className={className} href={tilTeamsAppen(url)}>
+    <textarea
+      ref={ref}
+      className={`${className} vd-voksende`}
+      value={value}
+      onChange={onChange}
+    />
+  );
+}
+
+/* Et nummereret trin i formularen */
+function Trin({ nr, titel, children }) {
+  return (
+    <section className="vd-trin" aria-label={`Trin ${nr}: ${titel}`}>
+      <div className="vd-trinnr" aria-hidden="true">
+        {nr}
+      </div>
+      <div className="vd-trinindhold">
+        <h3 className="vd-trintitel">{titel}</h3>
         {children}
-      </a>
-      <a className="vd-browser" href={url} target="_blank" rel="noopener noreferrer">
-        eller i browseren
-      </a>
-    </span>
+      </div>
+    </section>
   );
 }
 
@@ -704,21 +746,29 @@ function LinkKnapper({ links }) {
   return (
     <div className="vd-links">
       {gyldige.map((l, i) => (
-        <TeamsLink key={i} url={l.url} className="vd-aabn">
+        <a
+          key={i}
+          className="vd-aabn"
+          href={l.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Åbner i en ny fane"
+        >
           {knapTekst(l)} <span aria-hidden="true">↗</span>
-        </TeamsLink>
+        </a>
       ))}
     </div>
   );
 }
 
-/* Felter til ét eller flere links med et valgfrit navn hver */
-function LinkFelter({ links, onChange, førsteRef }) {
+/* Felter til ét eller flere links. Ældre opslag kan have et navn på et
+   link; det bevares, men kan ikke længere skrives. */
+function LinkFelter({ links, onChange, førsteRef, overskrift = true }) {
   const ret = (i, felt, værdi) =>
     onChange(links.map((l, j) => (j === i ? { ...l, [felt]: værdi } : l)));
   return (
     <div className="vd-mark">
-      <span>Links — fx til slides, optagelse eller artikel</span>
+      {overskrift && <span>Links — fx til slides, optagelse eller artikel</span>}
       {links.map((l, i) => (
         <div key={i} className="vd-linkrække">
           <input
@@ -728,13 +778,6 @@ function LinkFelter({ links, onChange, førsteRef }) {
             aria-label={`Link ${i + 1}`}
             value={l.url}
             onChange={(e) => ret(i, "url", e.target.value)}
-          />
-          <input
-            className="vd-input vd-linknavn"
-            placeholder={i === 0 ? "Navn, fx Slides" : "Navn, fx Optagelse"}
-            aria-label={`Navn på link ${i + 1}, valgfrit`}
-            value={l.navn}
-            onChange={(e) => ret(i, "navn", e.target.value)}
           />
           {links.length > 1 && (
             <button
@@ -754,9 +797,6 @@ function LinkFelter({ links, onChange, førsteRef }) {
       >
         + Tilføj endnu et link
       </button>
-      <span className="vd-hjaelp">
-        Navnet er valgfrit og står på knappen. Uden navn viser knappen filtypen.
-      </span>
     </div>
   );
 }
@@ -814,8 +854,7 @@ function Opslag({ post, begrundelse, navne, ny, onSlet, onRet }) {
           </label>
           <label className="vd-mark">
             <span>Opsummering</span>
-            <textarea
-              className="vd-input"
+            <VoksendeTekst
               value={udkast.opsummering}
               onChange={(e) => setUdkast({ ...udkast, opsummering: e.target.value })}
             />
@@ -1042,35 +1081,18 @@ function Adgangskode({ forkert, onIndsend }) {
 /*  Formular                                                           */
 /* ------------------------------------------------------------------ */
 
-function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
+function Formular({ navne, onGem, onAnnuller }) {
   const [links, setLinks] = useState([{ url: "", navn: "" }]);
   const [navn, setNavn] = useState(() => {
     const mit = hentMitNavn();
     return navne.includes(mit) ? mit : navne[0] || "";
   });
   const [dato, setDato] = useState(idag());
-  const [note, setNote] = useState("");
   const [transskription, setTransskription] = useState("");
   const [filer, setFiler] = useState([]);
   const [fejl, setFejl] = useState("");
   const [arbejder, setArbejder] = useState(false);
   const [udkast, setUdkast] = useState(null);
-  const nytNavnFelt = useRef(null);
-  const [tilføjer, setTilføjer] = useState(false);
-  const [nytNavn, setNytNavn] = useState("");
-
-  useEffect(() => {
-    if (tilføjer && nytNavnFelt.current) nytNavnFelt.current.focus();
-  }, [tilføjer]);
-
-  const gemNytNavn = () => {
-    const n = nytNavn.trim();
-    if (!n) return;
-    onNytNavn(n);
-    setNavn(n);
-    setNytNavn("");
-    setTilføjer(false);
-  };
 
   async function analyser() {
     setFejl("");
@@ -1084,23 +1106,49 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
     const hoved = liste[0].url;
     const offentligt = liste.find((l) => !BAG_LOGIN.test(l.url));
     const bagLogin = !offentligt; // alle links kræver login
-    if (bagLogin && filer.length === 0 && !transskription.trim() && !note.trim()) {
+    if (bagLogin && filer.length === 0 && !transskription.trim()) {
       setArbejder(false);
       return setFejl(
-        "AI'en kan ikke åbne filer bag skolens login. Vedhæft de samme filer nedenfor, indsæt et par afsnit fra dem, eller skriv en note om, hvad de handler om."
+        "AI'en kan ikke åbne filer bag skolens login. Vedhæft de samme filer i trin 3 — eller indsæt videoens transskription i trin 4, hvis det er en video."
       );
     }
 
-    /* Vedhæftede filer læses først. PowerPoint, Word og store PDF'er bliver
-       til tekst her i browseren; små PDF'er og billeder sendes som fil, så
-       længe de tilsammen holder sig under grænsen for ét kald. */
-    const filTekster = [];
+    /* Offentlige links (fx programmet for en konference) hentes altid med —
+       også når der er vedhæftet filer. YouTube har sin egen titelopslag. */
+    const ytLink = liste.find((l) => ER_YOUTUBE.test(l.url));
+    const [yt, ...hentede] = await Promise.all([
+      ytLink ? hentYouTubeInfo(ytLink.url) : null,
+      ...liste
+        .filter((l) => !BAG_LOGIN.test(l.url) && !ER_YOUTUBE.test(l.url))
+        .slice(0, 3)
+        .map(async (l) => ({ link: l, side: await hentSideTekst(l.url) })),
+    ]);
+    const sider = hentede.filter((h) => h.side);
+    const side = sider.length ? sider[0].side : null;
+
+    /* Afsnit med tekst til AI'en. Websider og indsat tekst får fast plads;
+       filerne deler resten af loftet ligeligt. */
+    const afsnit = [];
+    const indsat = transskription.trim().slice(0, MAKS_INDSAT);
+    if (indsat) afsnit.push({ overskrift: "Tekst, kollegaen har indsat", tekst: indsat });
+    for (const { link, side: s } of sider) {
+      afsnit.push({
+        overskrift: `Webside${link.navn ? ` (${link.navn})` : ""}: ${s.titel || link.url} — ${link.url}`,
+        tekst: s.tekst.slice(0, MAKS_SIDE),
+      });
+    }
+    const brugt = afsnit.reduce((sum, a) => sum + a.tekst.length, 0);
+    const filLoft = Math.floor(Math.max(MAKS_SAMLET - brugt, 20000) / Math.max(filer.length, 1));
+
+    /* Vedhæftede filer bliver til tekst her i browseren. Kun billeder og
+       scannede PDF'er sendes som fil, så længe de tilsammen holder sig under
+       grænsen for ét kald. */
     const filBlokke = [];
     let plads = MAKS_DIREKTE;
     for (const fil of filer) {
       let læst;
       try {
-        læst = await læsFil(fil, plads);
+        læst = await læsFil(fil, plads, filLoft);
       } catch (e) {
         setArbejder(false);
         return setFejl(
@@ -1114,7 +1162,7 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
         filBlokke.push(læst.blok);
         plads -= fil.size;
       } else if (tekst) {
-        filTekster.push(filer.length > 1 ? `Fra ${fil.name}:\n${tekst}` : tekst);
+        afsnit.push({ overskrift: `Vedhæftet fil: ${fil.name}`, tekst });
       } else {
         setArbejder(false);
         return setFejl(
@@ -1122,40 +1170,18 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
         );
       }
     }
-    const filTekst = filTekster.join("\n\n");
-    const filnavne = filer.map((f) => f.name).join(", ");
+    const tekstKilde = afsnit
+      .map((a) => `=== ${a.overskrift} ===\n${a.tekst}`)
+      .join("\n\n");
 
-    let tekstKilde = [transskription.trim(), filTekst]
-      .filter(Boolean)
-      .join("\n\n")
-      .slice(0, MAKS_SAMLET);
-    const ytLink = liste.find((l) => ER_YOUTUBE.test(l.url));
-    const yt = ytLink ? await hentYouTubeInfo(ytLink.url) : null;
-
-    /* Er der hverken fil eller indsat tekst, så prøv at hente det første
-       offentlige link på serveren */
-    let side = null;
-    if (!filBlokke.length && !tekstKilde && offentligt) {
-      side = await hentSideTekst(offentligt.url);
-      if (side) tekstKilde = side.tekst.slice(0, 12000);
-    }
-
-    const flere = filer.length > 1;
-    const kilde = filBlokke.length
-      ? `Kollegaen har vedhæftet ${flere ? "filerne" : "selve filen"} (${filnavne})${
-          filTekst ? ", og teksten fra nogle af dem står nedenfor" : ""
-        }. Byg titel, fagområde og opsummering på det faktiske indhold.`
-      : filTekst
-      ? `Nedenfor står teksten fra ${flere ? "de vedhæftede filer" : "den vedhæftede fil"} (${filnavne})${
-          transskription.trim() ? " og den tekst, kollegaen har indsat" : ""
-        }. Byg titel, fagområde og opsummering på den. Søg ikke.`
-      : side
-      ? `Nedenfor står teksten fra kilden. Byg opsummeringen på den — det er dit primære grundlag. Søg ikke. Teksten er hentet råt fra en webside, så se bort fra menupunkter, cookiebeskeder, kontaktoplysninger og gentagelser.`
-      : tekstKilde
-      ? `Nedenfor står tekst, som kollegaen har indsat fra kilden, fx en transskription. Byg opsummeringen på den — det er dit primære grundlag. Søg ikke.`
-      : bagLogin
-      ? `Linkene peger på filer bag skolens login, som du ikke kan åbne. Søg ikke, og find aldrig på indhold. Byg titel og opsummering på kollegaens note, og indled opsummeringen med "Kunne ikke læses automatisk."`
-      : `Slå ${offentligt.url} op på nettet, hvis siden er offentligt tilgængelig. Søg højst én gang. Kan du ikke komme ind — fordi siden kræver login, eller fordi indholdet er en video eller podcast, du hverken kan se eller høre — så find aldrig på indhold. Skriv i stedet en opsummering, der bygger på kollegaens note, og indled den med "Kunne ikke læses automatisk."`;
+    const kilde =
+      filBlokke.length || afsnit.length
+        ? `Nedenfor${filBlokke.length ? " og i de vedhæftede filer" : ""} står indholdet fra kilderne. Brug dem alle sammen — et program fortæller fx, hvem der talte om hvad, mens slides giver indholdet. Byg titel, fagområde og opsummering på det, der faktisk står. Søg ikke.${
+            sider.length
+              ? " Tekst fra websider er hentet råt, så se bort fra menupunkter, cookiebeskeder, kontaktoplysninger og gentagelser."
+              : ""
+          }`
+        : `Slå ${offentligt.url} op på nettet, hvis siden er offentligt tilgængelig. Søg højst én gang. Kan du ikke komme ind — fordi siden kræver login, eller fordi indholdet er en video eller podcast, du hverken kan se eller høre — så find aldrig på indhold. Skriv i stedet kort, hvad linket ser ud til at handle om, og indled med "Kunne ikke læses automatisk."`;
     const linkliste = liste
       .map((l, i) => {
         const format = filformat(l.url);
@@ -1168,18 +1194,17 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
 
 ${liste.length > 1 ? "Links" : "Link"}:
 ${linkliste}${
-      yt
-        ? `\nVideoens rigtige titel: "${yt.titel}"${yt.kanal ? ` (kanal: ${yt.kanal})` : ""}`
-        : side && side.titel
-        ? `\nSidens egen titel: "${side.titel}"`
-        : ""
+      yt ? `\nVideoens rigtige titel: "${yt.titel}"${yt.kanal ? ` (kanal: ${yt.kanal})` : ""}` : ""
     }
-Kollegaens egen note: ${note.trim() || "(ingen)"}
 
 ${kilde}
-${tekstKilde ? `\nTekst fra kilden:\n"""\n${tekstKilde}\n"""\n` : ""}
+${tekstKilde ? `\nKilder:\n"""\n${tekstKilde}\n"""\n` : ""}
+Opsummeringen skal stå mål med materialet:
+- En enkelt artikel, video eller kort tekst: 2-3 sætninger.
+- Omfattende materiale, fx en konference, mange slides eller flere oplæg: én indledende sætning, derefter én linje pr. oplæg eller hovedtema, der begynder med "• " og nævner oplægsholder eller organisation og de vigtigste pointer og tal (højst 12 linjer), og til sidst én sætning om, hvad det kan bruges til i undervisningen. Adskil linjerne med \\n.
+
 Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen markdown:
-{"titel":"kort sigende titel på dansk, max 12 ord","kategori":"et af: ${FAGLISTE}","type":"et af: ${TYPER.join(", ")}","opsummering":"2-3 sætninger på dansk i almindeligt sprog, der fortæller en underviser hvad det handler om, og hvad det kan bruges til"}`;
+{"titel":"kort sigende titel på dansk, max 12 ord","kategori":"et af: ${FAGLISTE}","type":"et af: ${TYPER.join(", ")}","opsummering":"på dansk i almindeligt sprog, som beskrevet ovenfor"}`;
 
     try {
       const indhold = filBlokke.length ? [...filBlokke, { type: "text", text: opgave }] : opgave;
@@ -1198,11 +1223,11 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
           ? j.kategori
           : "Markedsføring",
         type: TYPER.includes(j.type) ? j.type : gætType(hoved),
-        opsummering: j.opsummering || note.trim() || "",
+        opsummering: j.opsummering || "",
       });
       if (!j.opsummering) {
         setFejl(
-          "AI'en kunne ikke få fat i indholdet. Indsæt transskriptionen eller en beskrivelse, eller skriv opsummeringen selv nedenfor."
+          "AI'en kunne ikke få fat i indholdet. Gå tilbage og vedhæft filerne eller indsæt en transskription — eller skriv opsummeringen selv nedenfor."
         );
       }
     } catch (e) {
@@ -1210,7 +1235,7 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
         titel: (yt && yt.titel) || pænUrl(hoved),
         kategori: "Markedsføring",
         type: gætType(hoved),
-        opsummering: note.trim() || "",
+        opsummering: "",
       });
       setFejl(
         medDetalje("AI'en kunne ikke læse kilden. Skriv selv titel og opsummering nedenfor.", e)
@@ -1222,7 +1247,9 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
   if (udkast) {
     return (
       <div className="vd-form">
-        <h2 className="vd-display">Se det efter</h2>
+        <h2 className="vd-display">
+          <span className="vd-trinnr vd-trinnr-inline" aria-hidden="true">6</span> Se det efter og del
+        </h2>
         <p className="intro">
           AI'en har foreslået titel, fagområde og opsummering. Ret det, der ikke passer —
           det er dit opslag, der bliver gemt.
@@ -1265,8 +1292,7 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
           </div>
           <label className="vd-mark" style={{ marginBottom: 0 }}>
             <span>Opsummering</span>
-            <textarea
-              className="vd-input"
+            <VoksendeTekst
               value={udkast.opsummering}
               onChange={(e) => setUdkast({ ...udkast, opsummering: e.target.value })}
             />
@@ -1298,169 +1324,153 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
     );
   }
 
+  const harTeamsLink = links.some((l) => ER_M365.test(l.url));
+
   return (
     <div className="vd-form">
       <h2 className="vd-display">Del ny viden</h2>
       <p className="intro">
-        Indsæt linket, så foreslår AI'en titel, fagområde og en kort opsummering, som du
-        kan rette bagefter.
+        Følg trinene. AI'en læser materialet og foreslår titel, fagområde og opsummering,
+        som du kan rette, før det bliver delt.
       </p>
       {fejl && <div className="vd-fejl" role="alert">{fejl}</div>}
 
-      <div className="vd-tip">
-        <b>Har du selv filen?</b> En video, PowerPoint eller PDF fra en konference eller et
-        webinar lægges i mappen <i>Videndeling</i> under <i>Filer</i> i Teams-kanalen. Vælg{" "}
-        <i>Del → Kopiér link</i> på filen og indsæt linket her. Hører der flere filer til,
-        fx slides og optagelse, så tilføj et link til hver.
-        {TEAMS_MAPPE && (
-          <div style={{ marginTop: 8 }}>
-            <TeamsLink url={TEAMS_MAPPE}>Åbn mappen i Teams ↗</TeamsLink>
-          </div>
-        )}
-      </div>
+      <Trin nr={1} titel="Hvem deler, og hvornår?">
+        <div className="vd-todelt">
+          <label className="vd-mark">
+            <span>Hvem deler</span>
+            <select className="vd-input" value={navn} onChange={(e) => setNavn(e.target.value)}>
+              {navne.length === 0 && <option value="">Ingen navne endnu</option>}
+              {navne.map((n) => (
+                <option key={n}>{n}</option>
+              ))}
+            </select>
+          </label>
+          <label className="vd-mark">
+            <span>Dato</span>
+            <input
+              type="date"
+              className="vd-input"
+              value={dato}
+              onChange={(e) => setDato(e.target.value)}
+            />
+          </label>
+        </div>
+      </Trin>
 
-      <LinkFelter links={links} onChange={setLinks} />
-
-      <div className="vd-todelt">
-        <label className="vd-mark">
-          <span>Hvem deler</span>
-          {tilføjer ? (
-            <div className="vd-navnerække">
-              <input
-                ref={nytNavnFelt}
-                className="vd-input"
-                placeholder="Nyt navn"
-                value={nytNavn}
-                onChange={(e) => setNytNavn(e.target.value)}
-                onKeyDown={(e) => e.key === "Enter" && gemNytNavn()}
-              />
-              <button className="vd-tilfoej" onClick={gemNytNavn}>
-                Gem
-              </button>
-            </div>
-          ) : (
-            <div className="vd-navnerække">
-              <select
-                className="vd-input"
-                value={navn}
-                onChange={(e) => setNavn(e.target.value)}
-              >
-                {navne.length === 0 && <option value="">Ingen navne endnu</option>}
-                {navne.map((n) => (
-                  <option key={n}>{n}</option>
-                ))}
-              </select>
-              <button className="vd-tilfoej" onClick={() => setTilføjer(true)}>
-                + Navn
-              </button>
+      <Trin nr={2} titel="Link til filerne">
+        <div className="vd-tip">
+          <b>Sådan gør du:</b>
+          <ol>
+            <li>
+              En video, PowerPoint eller PDF fra en konference eller et webinar lægges i
+              mappen <i>Videndeling</i> under <i>Delt</i>.
+            </li>
+            <li>
+              Højreklik og vælg <i>Kopier link</i>.
+            </li>
+            <li>Indsæt linket i feltet nedenfor.</li>
+          </ol>
+          Hører der flere filer til, fx slides og optagelse, så tilføj et link til hver.
+          {TEAMS_MAPPE && (
+            <div style={{ marginTop: 8 }}>
+              <a href={TEAMS_MAPPE} target="_blank" rel="noopener noreferrer">
+                Åbn mappen i Teams ↗
+              </a>{" "}
+              <span className="vd-nyfane">(åbner i en ny fane, så denne side bliver stående)</span>
             </div>
           )}
-        </label>
+        </div>
+        <LinkFelter links={links} onChange={setLinks} overskrift={false} />
+      </Trin>
 
+      <Trin nr={3} titel="Vedhæft de samme filer">
         <label className="vd-mark">
-          <span>Dato</span>
+          <span>Så kan AI'en læse dem</span>
           <input
-            type="date"
-            className="vd-input"
-            value={dato}
-            onChange={(e) => setDato(e.target.value)}
+            type="file"
+            multiple
+            accept=".pdf,.pptx,.docx,application/pdf,image/png,image/jpeg,image/webp"
+            className="vd-input vd-filfelt"
+            onChange={(e) => {
+              setFejl("");
+              setFiler([...(e.target.files || [])]);
+            }}
           />
+          <span className="vd-hjaelp">
+            {filer.length
+              ? `${filer.map((f) => f.name).join(", ")} læses kun til opsummeringen og gemmes ikke her — filerne bliver i Teams.`
+              : "PowerPoint, Word, PDF eller billede — vælg gerne flere. Linkene er det, kollegerne klikker på."}
+          </span>
         </label>
-      </div>
-
-      <label className="vd-mark">
-        <span>Vedhæft de samme filer — så kan AI'en læse dem</span>
-        <input
-          type="file"
-          multiple
-          accept=".pdf,.pptx,.docx,application/pdf,image/png,image/jpeg,image/webp"
-          className="vd-input vd-filfelt"
-          onChange={(e) => {
-            setFejl("");
-            setFiler([...(e.target.files || [])]);
-          }}
-        />
-        <span className="vd-hjaelp">
-          {filer.length
-            ? `${filer.map((f) => f.name).join(", ")} læses kun til opsummeringen og gemmes ikke her — filerne bliver i Teams.`
-            : "PowerPoint, Word, PDF eller billede — vælg gerne flere. Linkene er det, kollegerne klikker på."}
-        </span>
-      </label>
-
-      {!filer.length && links.some((l) => ER_M365.test(l.url)) && (
-        <div className="vd-bemaerk">
-          Linket peger på en fil i Teams. AI'en kan ikke åbne den bag skolens login —
-          vedhæft den samme fil ovenfor, så kan AI'en læse den.
-          {links.some((l) => ER_M365.test(l.url) && filformat(l.url) === "Video") &&
-            " Er det en video, så åbn den i Teams og kopiér transskriptionen ind i tekstfeltet nedenfor, hvis der er en."}
-        </div>
-      )}
-      {!filer.length &&
-        !links.some((l) => ER_M365.test(l.url)) &&
-        links.some((l) => BAG_LOGIN.test(l.url)) && (
-        <div className="vd-bemaerk">
-          Linket ligger på et drev, der kræver login. AI'en bliver mødt af en loginskærm og
-          kan ikke se indholdet — vedhæft filen ovenfor, eller beskriv den i noten.
-        </div>
-      )}
-
-      <label className="vd-mark">
-        <span>Transskription eller tekst fra kilden — valgfri</span>
-        <textarea
-          className="vd-input vd-lang"
-          placeholder="Indsæt transskriptionen, videobeskrivelsen eller et par afsnit fra siden. Det er den sikreste vej til en god opsummering."
-          value={transskription}
-          onChange={(e) => setTransskription(e.target.value)}
-        />
-        <span className="vd-hjaelp">
-          {transskription.trim()
-            ? `${transskription.trim().length.toLocaleString("da-DK")} tegn — opsummeringen bygges på denne tekst.`
-            : "Teksten bruges kun til analysen og gemmes ikke."}
-        </span>
-      </label>
-
-      {!filer.length && !transskription.trim() && links.some((l) => ER_YOUTUBE.test(l.url)) && (
-        <div className="vd-bemaerk">
-          AI'en kan hverken se eller høre videoen. Åbn transskriptionen på YouTube under
-          "Vis udskrift", kopiér den og indsæt den i feltet ovenfor — så bliver
-          opsummeringen bygget på det, der faktisk bliver sagt.
-        </div>
-      )}
-
-      <label className="vd-mark">
-        <span>Note til AI'en — valgfri</span>
-        <textarea
-          className="vd-input"
-          placeholder="Fx: kapitel 4 er det interessante, brugbart til forløbet om prissætning"
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-        />
-      </label>
-
-      <div className="vd-handling">
-        {arbejder ? (
-          <Status
-            tekst={
-              filer.length
-                ? filer.length > 1
-                  ? "Læser de vedhæftede filer…"
-                  : "Læser den vedhæftede fil…"
-                : transskription.trim()
-                ? "Læser den indsatte tekst…"
-                : "Henter siden og skriver opsummering…"
-            }
-          />
-        ) : (
-          <>
-            <button className="vd-knap" onClick={analyser}>
-              Analysér linket
-            </button>
-            <button className="vd-annuller" onClick={onAnnuller}>
-              Annuller
-            </button>
-          </>
+        {!filer.length && harTeamsLink && (
+          <div className="vd-bemaerk" style={{ margin: "14px 0 0" }}>
+            AI'en kan ikke åbne filer i Teams bag skolens login. Vedhæft de samme filer her,
+            så kan AI'en læse dem.
+          </div>
         )}
-      </div>
+        {!filer.length && !harTeamsLink && links.some((l) => BAG_LOGIN.test(l.url)) && (
+          <div className="vd-bemaerk" style={{ margin: "14px 0 0" }}>
+            Linket ligger på et drev, der kræver login. AI'en kan ikke se indholdet — vedhæft
+            filen her.
+          </div>
+        )}
+      </Trin>
+
+      <Trin nr={4} titel="Video uden tekst? Indsæt transskriptionen (valgfrit)">
+        <label className="vd-mark">
+          <span>Kun til videoer</span>
+          <textarea
+            className="vd-input vd-lang"
+            placeholder="AI'en kan hverken se eller høre en video. Åbn videoen, kopiér dens transskription (udskrift), og indsæt den her."
+            value={transskription}
+            onChange={(e) => setTransskription(e.target.value)}
+          />
+          <span className="vd-hjaelp">
+            {transskription.trim()
+              ? `${transskription.trim().length.toLocaleString("da-DK")} tegn — opsummeringen bygges også på denne tekst.`
+              : "Spring trinnet over for PowerPoint, PDF og Word — dem læser AI'en selv fra trin 3. Teksten gemmes ikke."}
+          </span>
+        </label>
+        {!transskription.trim() && links.some((l) => ER_YOUTUBE.test(l.url)) && (
+          <div className="vd-bemaerk" style={{ margin: "14px 0 0" }}>
+            På YouTube finder du transskriptionen under "Vis udskrift" i videobeskrivelsen.
+          </div>
+        )}
+        {!transskription.trim() &&
+          links.some((l) => ER_M365.test(l.url) && filformat(l.url) === "Video") && (
+            <div className="vd-bemaerk" style={{ margin: "14px 0 0" }}>
+              Er videoen i Teams, kan du åbne den og kopiere transskriptionen, hvis den har en.
+            </div>
+          )}
+      </Trin>
+
+      <Trin nr={5} titel="Lad AI'en læse materialet">
+        <div className="vd-handling" style={{ marginTop: 0 }}>
+          {arbejder ? (
+            <Status
+              tekst={
+                filer.length
+                  ? filer.length > 1
+                    ? "Læser de vedhæftede filer…"
+                    : "Læser den vedhæftede fil…"
+                  : transskription.trim()
+                  ? "Læser den indsatte tekst…"
+                  : "Henter siden og skriver opsummering…"
+              }
+            />
+          ) : (
+            <>
+              <button className="vd-knap" onClick={analyser}>
+                Analysér
+              </button>
+              <button className="vd-annuller" onClick={onAnnuller}>
+                Annuller
+              </button>
+            </>
+          )}
+        </div>
+      </Trin>
     </div>
   );
 }
@@ -1583,11 +1593,6 @@ export default function Vidensdeling() {
     setBesked({ tekst: `"${post.titel}" er gendannet.` });
   };
 
-  const tilføjNavn = async (n) => {
-    let navne;
-    if (await gem(async () => (navne = await gemNavn(n)))) setData((d) => ({ ...d, navne }));
-  };
-
   const vælgFilter = (k) => setFilter((f) => (f === k ? "" : k));
 
   const aktive = data.opslag.filter((p) => !p.slettet);
@@ -1607,7 +1612,7 @@ export default function Vidensdeling() {
       kategori: p.kategori,
       navn: p.navn,
       dato: p.dato,
-      opsummering: (p.opsummering || "").slice(0, 400),
+      opsummering: (p.opsummering || "").slice(0, 800),
     }));
     const prompt = `Du er søgefunktion i et videndelingskatalog for undervisere på en dansk markedsføringsøkonom-uddannelse.
 
@@ -1713,7 +1718,6 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
             navne={data.navne}
             onGem={tilføjOpslag}
             onAnnuller={() => setVisning("liste")}
-            onNytNavn={tilføjNavn}
           />
         ) : visning === "papirkurv" ? (
           <section className="vd-form vd-papirkurv" style={{ maxWidth: "none" }}>

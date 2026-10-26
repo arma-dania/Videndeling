@@ -12,8 +12,9 @@ import { adgangNægtet } from "../lib/adgang.mjs";
 
 const MODEL = "claude-sonnet-5-5";
 // Modellen tænker altid først, og tænkningen tæller med i max_tokens —
-// derfor et loft med god plads til både tænkning og det korte JSON-svar
-const MAKS_TOKENS = 4000;
+// derfor et loft med god plads til både tænkning og en længere opsummering
+// af fx en hel konference
+const MAKS_TOKENS = 6000;
 const WEBSØGNING = { type: "web_search_20260209", name: "web_search", max_uses: 3 };
 
 export default async (request) => {

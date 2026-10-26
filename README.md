@@ -112,14 +112,21 @@ Teams".
   `VITE_TEAMS_MAPPE`. Udgiv derefter siden igen. Formularen viser så et link
   direkte til mappen.
 - **Flere links pr. opslag:** Et opslag kan have flere links, fx slides og
-  optagelse, hver med et valgfrit navn, der står på knappen. De gemmes i
-  feltet `links`; feltet `url` er altid det første link.
-- **Teams-appen:** Links til `teams.microsoft.com/l/…` åbner i Teams-appen
-  (via `msteams:`), med et lille "eller i browseren" ved siden af.
+  optagelse. Knappen viser filtypen, fx "Åbn PowerPoint i Teams". Linkene
+  gemmes i feltet `links`; feltet `url` er altid det første link.
+- **Navne:** Listen over, hvem der kan dele, ligger i databasen under
+  `vidensdeling:navne` (og som startliste i `STANDARDNAVNE` i
+  `src/App.jsx`). Den kan ikke længere udvides fra siden.
+- **Nyt vindue:** Alle links åbner i en ny fane, så siden bliver stående i
+  Teams-fanen og ikke starter forfra.
 - **AI'en og filer bag login:** AI'en kan ikke åbne filer bag skolens login.
-  Vedhæftes de samme filer i formularen (gerne flere), læses PowerPoint, Word og PDF'er over
-  3,5 MB i browseren, og kun teksten sendes til AI'en. Mindre PDF'er og
-  billeder sendes direkte. Filen gemmes ingen steder af siden.
+  Vedhæftes de samme filer i formularen (gerne flere), læses PowerPoint, Word og PDF'er
+  i browseren, og kun teksten sendes til AI'en. Kun billeder og scannede
+  PDF'er uden tekst sendes som fil. Filen gemmes ingen steder af siden.
+- **Lange præsentationer:** AI'en får op til ca. 120.000 tegn (ca. 30.000
+  ord) i alt. Er en præsentation længere, forkortes hvert dias eller hver
+  side lige meget, så alle oplæg kommer med. Offentlige links, fx et
+  konferenceprogram, hentes altid med, også når der er vedhæftet filer.
 
 ## Sådan gemmes data
 
