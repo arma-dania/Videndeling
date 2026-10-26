@@ -112,8 +112,11 @@ Teams".
   `VITE_TEAMS_MAPPE`. Udgiv derefter siden igen. Formularen viser så et link
   direkte til mappen.
 - **Flere links pr. opslag:** Et opslag kan have flere links, fx slides og
-  optagelse, hver med et valgfrit navn, der står på knappen. De gemmes i
-  feltet `links`; feltet `url` er altid det første link.
+  optagelse. Knappen viser filtypen, fx "Åbn PowerPoint i Teams". Linkene
+  gemmes i feltet `links`; feltet `url` er altid det første link.
+- **Navne:** Listen over, hvem der kan dele, ligger i databasen under
+  `vidensdeling:navne` (og som startliste i `STANDARDNAVNE` i
+  `src/App.jsx`). Den kan ikke længere udvides fra siden.
 - **Nyt vindue:** Alle links åbner i en ny fane, så siden bliver stående i
   Teams-fanen og ikke starter forfra.
 - **AI'en og filer bag login:** AI'en kan ikke åbne filer bag skolens login.
