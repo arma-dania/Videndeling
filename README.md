@@ -111,8 +111,13 @@ Teams".
   *Kopiér link*, og tilføj linket i Netlify under Environment variables som
   `VITE_TEAMS_MAPPE`. Udgiv derefter siden igen. Formularen viser så et link
   direkte til mappen.
+- **Flere links pr. opslag:** Et opslag kan have flere links, fx slides og
+  optagelse, hver med et valgfrit navn, der står på knappen. De gemmes i
+  feltet `links`; feltet `url` er altid det første link.
+- **Teams-appen:** Links til `teams.microsoft.com/l/…` åbner i Teams-appen
+  (via `msteams:`), med et lille "eller i browseren" ved siden af.
 - **AI'en og filer bag login:** AI'en kan ikke åbne filer bag skolens login.
-  Vedhæftes den samme fil i formularen, læses PowerPoint, Word og PDF'er over
+  Vedhæftes de samme filer i formularen (gerne flere), læses PowerPoint, Word og PDF'er over
   3,5 MB i browseren, og kun teksten sendes til AI'en. Mindre PDF'er og
   billeder sendes direkte. Filen gemmes ingen steder af siden.
 
