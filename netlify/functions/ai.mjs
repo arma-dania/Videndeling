@@ -4,15 +4,17 @@
 // Nøglen sættes i Netlify under Site configuration → Environment variables
 // som ANTHROPIC_API_KEY. Den må aldrig stå i koden eller i repoet.
 //
-// Model, loft over svarlængde og værktøjer bestemmes her på serveren —
+// Model, svarlængde og værktøjer bestemmes her på serveren —
 // ikke af browseren — så endepunktet ikke kan bruges til hvad som helst
 // på jeres regning. Det eneste værktøj, browseren kan bede om, er websøgning.
 
 import { adgangNægtet } from "../lib/adgang.mjs";
 
-const MODEL = "claude-sonnet-4-6";
-const MAKS_TOKENS = 1500;
-const WEBSØGNING = { type: "web_search_20250305", name: "web_search", max_uses: 3 };
+const MODEL = "claude-sonnet-5-5";
+// Modellen tænker altid først, og tænkningen tæller med i max_tokens —
+// derfor et loft med god plads til både tænkning og det korte JSON-svar
+const MAKS_TOKENS = 4000;
+const WEBSØGNING = { type: "web_search_20260209", name: "web_search", max_uses: 3 };
 
 export default async (request) => {
   const svarhoved = { "Content-Type": "application/json; charset=utf-8" };
@@ -54,11 +56,14 @@ export default async (request) => {
     });
   }
 
-  const ønsket = Number(indkommet.max_tokens) || 1000;
   const krop = {
     model: MODEL,
-    max_tokens: Math.min(Math.max(ønsket, 1), MAKS_TOKENS),
+    max_tokens: MAKS_TOKENS,
     messages: indkommet.messages,
+    // Opsummering og søgning er enkle opgaver — lav effort holder svaret hurtigt og billigt
+    output_config: { effort: "low" },
+    // Afviser sikkerhedsfiltret en anmodning, prøver API'et selv en anden model
+    fallbacks: "default",
   };
   const vilSøge =
     Array.isArray(indkommet.tools) &&
@@ -72,6 +77,7 @@ export default async (request) => {
         "Content-Type": "application/json",
         "x-api-key": nøgle,
         "anthropic-version": "2023-06-01",
+        "anthropic-beta": "server-side-fallback-2026-07-01",
       },
       body: JSON.stringify(krop),
     });

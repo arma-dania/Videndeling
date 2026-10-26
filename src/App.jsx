@@ -4,7 +4,8 @@ import { storage, adgangshoveder, gemKode, hentKode } from "./lager.js";
 /*  Data og konstanter                                                 */
 /* ------------------------------------------------------------------ */
 
-const NOEGLE = "vidensdeling:v1";
+/* Nøglen, hele kataloget lå under i første version — se flytGammeltKatalog() */
+const NOEGLE_GAMMEL = "vidensdeling:v1";
 
 const FAGOMRAADER = [
   { navn: "Markedsføring", farve: "#cb142a" },
@@ -151,21 +152,24 @@ function udtrækJson(tekst) {
 }
 
 async function spørgClaude(indhold, brugWebsøgning) {
-  // Model og loft over svarlængde bestemmes af serveren (netlify/functions/ai.mjs)
-  const body = {
-    max_tokens: 1000,
-    messages: [{ role: "user", content: indhold }],
-  };
+  // Model og svarlængde bestemmes af serveren (netlify/functions/ai.mjs)
+  const body = { messages: [{ role: "user", content: indhold }] };
   if (brugWebsøgning) {
-    body.tools = [{ type: "web_search_20250305", name: "web_search" }];
+    body.tools = [{ type: "web_search", name: "web_search" }];
   }
   const svar = await fetch("/.netlify/functions/ai", {
     method: "POST",
     headers: { "Content-Type": "application/json", ...adgangshoveder() },
     body: JSON.stringify(body),
   });
-  if (!svar.ok) throw new Error(`AI-fejl ${svar.status}`);
-  const data = await svar.json();
+  const data = await svar.json().catch(() => null);
+  if (!svar.ok) {
+    // Gem serverens egen forklaring, fx at API-nøglen mangler, så den kan vises
+    const fejl = new Error(`AI-fejl ${svar.status}`);
+    fejl.detalje =
+      (data && (data.fejl || (data.error && data.error.message))) || `status ${svar.status}`;
+    throw fejl;
+  }
   if (!data || !Array.isArray(data.content)) throw new Error("Uventet svar");
   return data.content
     .filter((b) => b.type === "text")
@@ -173,40 +177,121 @@ async function spørgClaude(indhold, brugWebsøgning) {
     .join("\n");
 }
 
+const medDetalje = (tekst, e) =>
+  e && e.detalje ? `${tekst} (Besked fra serveren: ${e.detalje})` : tekst;
+
 /* ------------------------------------------------------------------ */
 /*  Delt lagring                                                       */
 /* ------------------------------------------------------------------ */
 
-let hukommelse = { opslag: [], navne: STANDARDNAVNE };
+/* Hvert opslag ligger under sin egen nøgle, så to kolleger, der gemmer
+   samtidig, ikke overskriver hinandens ændringer. Slettede opslag får
+   feltet "slettet" i stedet for at blive fjernet, så de kan gendannes. */
+const PRAEFIKS_OPSLAG = "vidensdeling:opslag:";
+const NOEGLE_NAVNE = "vidensdeling:navne";
 
-async function hentData() {
-  if (!storage) return hukommelse;
+function læsJson(tekst) {
   try {
-    const r = await storage.get(NOEGLE, true);
-    if (r && r.value) {
-      const d = JSON.parse(r.value);
-      return {
-        opslag: d.opslag || [],
-        navne: d.navne && d.navne.length ? d.navne : STANDARDNAVNE,
-      };
-    }
-  } catch (e) {
-    /* Findes nøglen ikke endnu, er kataloget bare tomt. Alle andre fejl
-       sendes videre — ellers ville gemData() overskrive hele kataloget
-       med en tom liste, hvis lageret var midlertidigt utilgængeligt. */
-    if (!e.fandtesIkke) throw e;
+    return JSON.parse(tekst);
+  } catch {
+    return null;
   }
-  return { opslag: [], navne: STANDARDNAVNE };
 }
 
-async function gemData(opdater) {
-  const nuværende = await hentData();
-  const næste = opdater(nuværende);
-  hukommelse = næste;
-  if (storage) {
-    await storage.set(NOEGLE, JSON.stringify(næste), true);
+async function hentNøgle(noegle) {
+  try {
+    return læsJson((await storage.get(noegle)).value);
+  } catch (e) {
+    if (e.fandtesIkke) return null;
+    throw e;
   }
+}
+
+/* Første version gemte hele kataloget under én nøgle. Findes den stadig,
+   flyttes opslagene over i hver sin nøgle, og den gamle værdi gemmes som
+   sikkerhedskopi under "vidensdeling:kopi:…", før den fjernes. */
+async function flytGammeltKatalog() {
+  const gammel = await hentNøgle(NOEGLE_GAMMEL);
+  if (!gammel) return;
+  const findes = new Set((await storage.list(PRAEFIKS_OPSLAG)).keys);
+  await Promise.all(
+    (gammel.opslag || [])
+      .filter((p) => p && p.id && !findes.has(PRAEFIKS_OPSLAG + p.id))
+      .map((p) => storage.set(PRAEFIKS_OPSLAG + p.id, JSON.stringify(p)))
+  );
+  if (Array.isArray(gammel.navne) && gammel.navne.length) {
+    const navne = (await hentNøgle(NOEGLE_NAVNE)) || [];
+    const alle = [...new Set([...navne, ...gammel.navne])].sort((a, b) =>
+      a.localeCompare(b, "da")
+    );
+    await storage.set(NOEGLE_NAVNE, JSON.stringify(alle));
+  }
+  await storage.set(`vidensdeling:kopi:v1:${Date.now()}`, JSON.stringify(gammel));
+  await storage.delete(NOEGLE_GAMMEL);
+}
+
+/* En lagerfejl kastes videre, så den kan vises — den må aldrig tolkes som
+   et tomt katalog */
+async function hentData() {
+  await flytGammeltKatalog();
+  const [alle, navne] = await Promise.all([
+    storage.hentAlle(PRAEFIKS_OPSLAG),
+    hentNøgle(NOEGLE_NAVNE),
+  ]);
+  return {
+    opslag: Object.values(alle)
+      .map(læsJson)
+      .filter((p) => p && p.id),
+    navne: Array.isArray(navne) && navne.length ? navne : STANDARDNAVNE,
+  };
+}
+
+const gemOpslag = (post) => storage.set(PRAEFIKS_OPSLAG + post.id, JSON.stringify(post));
+
+async function gemNavn(navn) {
+  const navne = (await hentNøgle(NOEGLE_NAVNE)) || STANDARDNAVNE;
+  const næste = navne.includes(navn)
+    ? navne
+    : [...navne, navn].sort((a, b) => a.localeCompare(b, "da"));
+  await storage.set(NOEGLE_NAVNE, JSON.stringify(næste));
   return næste;
+}
+
+/* Browseren husker, hvem man er, så navnet er valgt på forhånd næste gang */
+const MIT_NAVN = "vidensdeling:mitnavn";
+
+function hentMitNavn() {
+  try {
+    return localStorage.getItem(MIT_NAVN) || "";
+  } catch {
+    return "";
+  }
+}
+
+function gemMitNavn(navn) {
+  try {
+    localStorage.setItem(MIT_NAVN, navn);
+  } catch {
+    /* privat vindue o.l. */
+  }
+}
+
+/* Den AI-baserede søgning får hele kataloget med. Bliver det meget stort,
+   sendes kun de opslag, der deler flest ord med behovet */
+const MAKS_I_SØGNING = 150;
+
+function forfiltrer(q, opslag) {
+  if (opslag.length <= MAKS_I_SØGNING) return opslag;
+  const ord = q.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
+  const point = (p) => {
+    const t = `${p.titel} ${p.opsummering} ${p.kategori} ${p.navn}`.toLowerCase();
+    return ord.reduce((sum, w) => sum + (t.includes(w) ? 1 : 0), 0);
+  };
+  return opslag
+    .map((p) => [point(p), p])
+    .sort((a, b) => b[0] - a[0] || (b[1].dato || "").localeCompare(a[1].dato || ""))
+    .slice(0, MAKS_I_SØGNING)
+    .map(([, p]) => p);
 }
 
 /* ------------------------------------------------------------------ */
@@ -228,6 +313,8 @@ const STIL = `
 
 .vd-display { font-family:"Bricolage Grotesque",system-ui,sans-serif; letter-spacing:-0.02em; }
 .vd-mono { font-family:"IBM Plex Mono",ui-monospace,monospace; }
+.vd-skjult { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden;
+  clip:rect(0,0,0,0); white-space:nowrap; border:0; }
 
 /* Topbjælke */
 .vd-top { background:var(--rod); color:#fff; }
@@ -251,7 +338,7 @@ const STIL = `
 .vd-soegerække { display:flex; gap:10px; flex-wrap:wrap; }
 .vd-soegefelt { flex:1 1 320px; min-width:0; padding:15px 18px; border:1.5px solid var(--linje);
   border-radius:4px; background:#fff; }
-.vd-soegefelt::placeholder { color:#A79BA0; }
+.vd-soegefelt::placeholder { color:#7E7378; }
 .vd-soegefelt:focus { border-color:var(--rod); outline:none; }
 .vd-knap { background:var(--rod); color:#fff; font-weight:600; padding:15px 26px; border-radius:4px; }
 .vd-knap:hover { background:var(--rod-dyb); }
@@ -283,7 +370,9 @@ const STIL = `
 /* Opslag */
 .vd-liste { list-style:none; margin:24px 0 0; padding:0;
   display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; align-items:start; }
-.vd-post { border:1px solid var(--linje); border-radius:5px; padding:20px 20px 16px; background:#fff; }
+.vd-post { border:1px solid var(--linje); border-radius:5px; padding:20px 20px 16px; background:#fff;
+  transition:box-shadow .6s ease, border-color .6s ease; }
+.vd-post.vd-ny { border-color:var(--rod); box-shadow:0 0 0 3px var(--rod-lys); }
 .vd-hoved { font-family:"IBM Plex Mono",monospace; font-size:12px; line-height:1.5;
   display:flex; gap:9px; flex-wrap:wrap; margin-bottom:10px; }
 .vd-hoved .d { color:var(--graa); }
@@ -363,12 +452,29 @@ textarea.vd-lang { min-height:150px; font-size:14px; }
 @keyframes vd-snur { to { transform:rotate(360deg); } }
 
 .vd-fod { max-width:980px; margin:0 auto; padding:0 22px 40px; font-size:12.5px; color:var(--graa); }
+.vd-fod button { font-size:12.5px; color:var(--graa); text-decoration:underline; text-underline-offset:3px; }
+.vd-fod button:hover { color:var(--rod); }
+
+/* Beskedbjælke nederst */
+.vd-besked { position:fixed; left:50%; bottom:22px; transform:translateX(-50%); z-index:10;
+  display:flex; gap:16px; align-items:center; width:max-content; max-width:calc(100% - 32px);
+  background:var(--blaek); color:#fff; padding:12px 18px; border-radius:6px;
+  box-shadow:0 6px 24px rgba(0,0,0,.18); font-size:14.5px; }
+.vd-besked button { color:#fff; font-weight:600; text-decoration:underline; text-underline-offset:3px; white-space:nowrap; }
+
+/* Slettede opslag */
+.vd-papirkurv .vd-post { opacity:.85; }
+.vd-papirkurv .vd-meta { margin-top:10px; }
 
 @media (max-width:760px) {
   .vd-liste { grid-template-columns:1fr; }
 }
 @media (max-width:620px) {
   .vd-todelt { grid-template-columns:1fr; }
+  /* Filtrene på én vandret, rulbar linje i stedet for fem linjer */
+  .vd-filtre { flex-wrap:nowrap; overflow-x:auto; width:100%; padding-bottom:4px;
+    scrollbar-width:thin; }
+  .vd-filtre > * { flex:none; }
 }
 @media (prefers-reduced-motion:reduce) {
   .vd *, .vd *::before { animation-duration:.001ms !important; transition-duration:.001ms !important; }
@@ -381,8 +487,8 @@ textarea.vd-lang { min-height:150px; font-size:14px; }
 
 function Status({ tekst }) {
   return (
-    <div className="vd-status">
-      <div className="vd-spinner" />
+    <div className="vd-status" role="status" aria-live="polite">
+      <div className="vd-spinner" aria-hidden="true" />
       <span>{tekst}</span>
     </div>
   );
@@ -402,7 +508,7 @@ function Pil() {
   );
 }
 
-function Opslag({ post, begrundelse, navne, onSlet, onRet }) {
+function Opslag({ post, begrundelse, navne, ny, onSlet, onRet }) {
   const [bekræft, setBekræft] = useState(false);
   const [udkast, setUdkast] = useState(null);
   const [åben, setÅben] = useState(false);
@@ -410,6 +516,14 @@ function Opslag({ post, begrundelse, navne, onSlet, onRet }) {
   const [retfejl, setRetfejl] = useState("");
   const førsteFelt = useRef(null);
   const resumeRef = useRef(null);
+  const kortRef = useRef(null);
+
+  /* Et opslag, man lige har delt, rulles frem, så man kan se det */
+  useEffect(() => {
+    if (ny && kortRef.current && kortRef.current.scrollIntoView) {
+      kortRef.current.scrollIntoView({ block: "center", behavior: "smooth" });
+    }
+  }, [ny]);
 
   useEffect(() => {
     if (udkast && førsteFelt.current) førsteFelt.current.focus();
@@ -541,7 +655,7 @@ function Opslag({ post, begrundelse, navne, onSlet, onRet }) {
   }
 
   return (
-    <li className="vd-post">
+    <li ref={kortRef} className={`vd-post${ny ? " vd-ny" : ""}`}>
       <div className="vd-hoved">
         <span className="d">{visDato(post.dato)}</span>
         <span aria-hidden="true">·</span>
@@ -680,7 +794,10 @@ function Adgangskode({ forkert, onIndsend }) {
 
 function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
   const [url, setUrl] = useState("");
-  const [navn, setNavn] = useState(navne[0] || "");
+  const [navn, setNavn] = useState(() => {
+    const mit = hentMitNavn();
+    return navne.includes(mit) ? mit : navne[0] || "";
+  });
   const [dato, setDato] = useState(idag());
   const [note, setNote] = useState("");
   const [transskription, setTransskription] = useState("");
@@ -784,14 +901,16 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
           "AI'en kunne ikke få fat i indholdet. Indsæt transskriptionen eller en beskrivelse, eller skriv opsummeringen selv nedenfor."
         );
       }
-    } catch {
+    } catch (e) {
       setUdkast({
         titel: (yt && yt.titel) || pænUrl(link),
         kategori: "Markedsføring",
         type: gætType(link),
         opsummering: note.trim() || "",
       });
-      setFejl("AI'en kunne ikke læse kilden. Skriv selv titel og opsummering nedenfor.");
+      setFejl(
+        medDetalje("AI'en kunne ikke læse kilden. Skriv selv titel og opsummering nedenfor.", e)
+      );
     }
     setArbejder(false);
   }
@@ -804,7 +923,7 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
           AI'en har foreslået titel, fagområde og opsummering. Ret det, der ikke passer —
           det er dit opslag, der bliver gemt.
         </p>
-        {fejl && <div className="vd-fejl">{fejl}</div>}
+        {fejl && <div className="vd-fejl" role="alert">{fejl}</div>}
         <div className="vd-gennemsyn">
           <label className="vd-mark">
             <span>Titel</span>
@@ -852,15 +971,16 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
         <div className="vd-handling">
           <button
             className="vd-knap"
-            onClick={() =>
+            onClick={() => {
+              gemMitNavn(navn);
               onGem({
                 id: `p${Date.now()}${Math.floor(Math.random() * 999)}`,
                 url: normaliserUrl(url),
                 navn,
                 dato,
                 ...udkast,
-              })
-            }
+              });
+            }}
           >
             Del med kollegerne
           </button>
@@ -879,7 +999,7 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
         Indsæt linket, så foreslår AI'en titel, fagområde og en kort opsummering, som du
         kan rette bagefter.
       </p>
-      {fejl && <div className="vd-fejl">{fejl}</div>}
+      {fejl && <div className="vd-fejl" role="alert">{fejl}</div>}
 
       <label className="vd-mark">
         <span>Link til dokument, podcast eller video</span>
@@ -1046,6 +1166,21 @@ export default function Vidensdeling() {
   const [søgefejl, setSøgefejl] = useState("");
   const [låst, setLåst] = useState(false);
   const [lagerfejl, setLagerfejl] = useState("");
+  const [besked, setBesked] = useState(null); // { tekst, fortryd?: id }
+  const [nytId, setNytId] = useState("");
+
+  /* Beskeden nederst og markeringen af et nyt opslag forsvinder af sig selv */
+  useEffect(() => {
+    if (!besked) return;
+    const t = setTimeout(() => setBesked(null), 8000);
+    return () => clearTimeout(t);
+  }, [besked]);
+
+  useEffect(() => {
+    if (!nytId) return;
+    const t = setTimeout(() => setNytId(""), 4000);
+    return () => clearTimeout(t);
+  }, [nytId]);
 
   /* 401 betyder, at serveren kræver den fælles adgangskode */
   const håndterLagerfejl = (e, tekst) => {
@@ -1072,10 +1207,10 @@ export default function Vidensdeling() {
     indlæs();
   }, []);
 
-  /* Returnerer true, hvis ændringen blev gemt */
-  const opdater = async (fn) => {
+  /* Kører en gemning og returnerer true, hvis den lykkedes */
+  const gem = async (handling) => {
     try {
-      setData(await gemData(fn));
+      await handling();
       setLagerfejl("");
       return true;
     } catch (e) {
@@ -1084,52 +1219,83 @@ export default function Vidensdeling() {
     }
   };
 
+  /* Lægger et opslag ind i listen, eller erstatter det, hvis det findes */
+  const sætOpslag = (post) =>
+    setData((d) => ({
+      ...d,
+      opslag: d.opslag.some((p) => p.id === post.id)
+        ? d.opslag.map((p) => (p.id === post.id ? post : p))
+        : [post, ...d.opslag],
+    }));
+
   const tilføjOpslag = async (post) => {
-    if (!(await opdater((d) => ({ ...d, opslag: [post, ...d.opslag] })))) return;
+    if (!(await gem(() => gemOpslag(post)))) return;
+    sætOpslag(post);
     setVisning("liste");
     setResultat(null);
     setSøgning("");
+    setFilter("");
+    setNytId(post.id);
+    setBesked({ tekst: "Dit opslag er delt med kollegerne." });
   };
 
   const retOpslag = async (post) => {
-    const gemt = await opdater((d) => ({
-      ...d,
-      opslag: d.opslag.map((p) => (p.id === post.id ? { ...p, ...post } : p)),
-    }));
-    if (!gemt) return;
+    const { begrundelse, ...ren } = post; // søgningens begrundelse gemmes ikke
+    if (!(await gem(() => gemOpslag(ren)))) return;
+    sætOpslag(ren);
     setResultat((r) =>
-      r ? r.map((x) => (x.id === post.id ? { ...x, ...post } : x)) : r
+      r ? r.map((x) => (x.id === ren.id ? { ...ren, begrundelse: x.begrundelse } : x)) : r
     );
   };
 
   const sletOpslag = async (id) => {
-    if (!(await opdater((d) => ({ ...d, opslag: d.opslag.filter((p) => p.id !== id) }))))
-      return;
+    const post = data.opslag.find((p) => p.id === id);
+    if (!post) return;
+    const slettet = { ...post, slettet: idag() };
+    if (!(await gem(() => gemOpslag(slettet)))) return;
+    sætOpslag(slettet);
     setResultat((r) => (r ? r.filter((x) => x.id !== id) : r));
+    setBesked({ tekst: `"${post.titel}" er slettet.`, fortryd: id });
   };
 
-  const tilføjNavn = (n) =>
-    opdater((d) => (d.navne.includes(n) ? d : { ...d, navne: [...d.navne, n].sort() }));
+  const gendanOpslag = async (id) => {
+    const post = data.opslag.find((p) => p.id === id);
+    if (!post) return;
+    const { slettet, ...gendannet } = post;
+    if (!(await gem(() => gemOpslag(gendannet)))) return;
+    sætOpslag(gendannet);
+    setBesked({ tekst: `"${post.titel}" er gendannet.` });
+  };
+
+  const tilføjNavn = async (n) => {
+    let navne;
+    if (await gem(async () => (navne = await gemNavn(n)))) setData((d) => ({ ...d, navne }));
+  };
 
   const vælgFilter = (k) => setFilter((f) => (f === k ? "" : k));
 
-  async function søg() {
-    const q = søgning.trim();
+  const aktive = data.opslag.filter((p) => !p.slettet);
+  const slettede = data.opslag
+    .filter((p) => p.slettet)
+    .sort((a, b) => b.slettet.localeCompare(a.slettet));
+
+  async function søg(tekst = søgning) {
+    const q = tekst.trim();
     setSøgefejl("");
     if (!q) return setResultat(null);
-    if (data.opslag.length === 0) return setSøgefejl("Der er ingen opslag at søge i endnu.");
+    if (aktive.length === 0) return setSøgefejl("Der er ingen opslag at søge i endnu.");
     setSøger(true);
-    const katalog = data.opslag.map((p) => ({
+    const katalog = forfiltrer(q, aktive).map((p) => ({
       id: p.id,
       titel: p.titel,
       kategori: p.kategori,
       navn: p.navn,
       dato: p.dato,
-      opsummering: p.opsummering,
+      opsummering: (p.opsummering || "").slice(0, 400),
     }));
     const prompt = `Du er søgefunktion i et videndelingskatalog for undervisere på en dansk markedsføringsøkonom-uddannelse.
 
-Kollegaen skriver hvad hun har brug for, i almindeligt sprog. Find de opslag der reelt dækker behovet — også når ordene ikke er de samme. Tag kun opslag med, der faktisk er relevante; er der ingen, så returnér en tom liste.
+Kollegaen beskriver sit behov i almindeligt sprog. Find de opslag der reelt dækker behovet — også når ordene ikke er de samme. Tag kun opslag med, der faktisk er relevante; er der ingen, så returnér en tom liste.
 
 Behov: "${q}"
 
@@ -1141,21 +1307,25 @@ Svar KUN med JSON, uden markdown:
 Sortér med det mest relevante først. Højst 8 resultater.`;
 
     try {
-      const tekst = await spørgClaude(prompt, false);
-      const j = udtrækJson(tekst);
+      const svar = await spørgClaude(prompt, false);
+      const j = udtrækJson(svar);
       if (!Array.isArray(j)) throw new Error("format");
-      const map = new Map(data.opslag.map((p) => [p.id, p]));
+      const map = new Map(aktive.map((p) => [p.id, p]));
       setResultat(
-        j.map((r) => ({ ...map.get(r.id), begrundelse: r.begrundelse })).filter((r) => r.id)
+        j
+          .filter((r) => r && map.has(r.id))
+          .map((r) => ({ ...map.get(r.id), begrundelse: r.begrundelse }))
       );
-    } catch {
+    } catch (e) {
       const ord = q.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
       setResultat(
-        data.opslag.filter((p) =>
+        aktive.filter((p) =>
           ord.some((w) => `${p.titel} ${p.opsummering} ${p.kategori}`.toLowerCase().includes(w))
         )
       );
-      setSøgefejl("AI-søgningen svarede ikke. Nedenfor er en almindelig tekstsøgning i stedet.");
+      setSøgefejl(
+        medDetalje("AI-søgningen svarede ikke. Nedenfor er en almindelig tekstsøgning i stedet.", e)
+      );
     }
     setSøger(false);
   }
@@ -1165,7 +1335,7 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
     const i = FAGOMRAADER.findIndex((f) => f.navn === k);
     return i < 0 ? 99 : i;
   };
-  let viste = resultat || [...data.opslag];
+  let viste = resultat || [...aktive];
   if (filter) viste = viste.filter((p) => p.kategori === filter);
   if (!resultat) {
     viste.sort((a, b) => {
@@ -1185,6 +1355,10 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
       return omvendt ? -r : r;
     });
   }
+  const tæller =
+    resultat || filter
+      ? `${viste.length} af ${aktive.length} opslag`
+      : `${aktive.length} opslag`;
 
   return (
     <div className="vd">
@@ -1196,7 +1370,7 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
             Vidensdeling
             <span>Markedsføringsøkonom</span>
           </h1>
-          {visning === "liste" && !låst && (
+          {visning !== "ny" && !låst && (
             <button className="vd-del" onClick={() => setVisning("ny")}>
               + Del ny viden
             </button>
@@ -1225,19 +1399,58 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
             onAnnuller={() => setVisning("liste")}
             onNytNavn={tilføjNavn}
           />
+        ) : visning === "papirkurv" ? (
+          <section className="vd-form vd-papirkurv" style={{ maxWidth: "none" }}>
+            <h2 className="vd-display">Slettede opslag</h2>
+            <p className="intro">
+              Slettede opslag gemmes, så de kan hentes tilbage. Gendan dem, der blev slettet
+              ved en fejl.
+            </p>
+            {slettede.length === 0 ? (
+              <p>Der er ingen slettede opslag.</p>
+            ) : (
+              <ul className="vd-liste" style={{ marginTop: 0 }}>
+                {slettede.map((p) => (
+                  <li key={p.id} className="vd-post">
+                    <div className="vd-hoved">
+                      <span className="d">Slettet {visDato(p.slettet)}</span>
+                      <span aria-hidden="true">·</span>
+                      <span className="n">{p.navn}</span>
+                    </div>
+                    <h3 className="vd-titel">{p.titel}</h3>
+                    <div className="vd-meta">
+                      <button className="vd-slet" onClick={() => gendanOpslag(p.id)}>
+                        Gendan
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="vd-handling">
+              <button className="vd-annuller" onClick={() => setVisning("liste")}>
+                Tilbage til kataloget
+              </button>
+            </div>
+          </section>
         ) : (
           <>
             <section className="vd-hero">
               <h2>Hvad har du brug for?</h2>
               <div className="vd-soegerække">
+                <label htmlFor="vd-soeg" className="vd-skjult">
+                  Søg i kataloget
+                </label>
                 <input
+                  id="vd-soeg"
+                  type="search"
                   className="vd-soegefelt"
                   placeholder="Skriv det som en sætning — fx det du mangler til næste undervisningsgang"
                   value={søgning}
                   onChange={(e) => setSøgning(e.target.value)}
                   onKeyDown={(e) => e.key === "Enter" && søg()}
                 />
-                <button className="vd-knap" onClick={søg} disabled={søger}>
+                <button className="vd-knap" onClick={() => søg()} disabled={søger}>
                   Søg
                 </button>
                 {resultat && (
@@ -1259,7 +1472,7 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
                 </div>
               )}
               {søgefejl && !søger && (
-                <div className="vd-fejl" style={{ marginTop: 14 }}>
+                <div className="vd-fejl" role="alert" style={{ marginTop: 14 }}>
                   {søgefejl}
                 </div>
               )}
@@ -1272,6 +1485,7 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
                       className="vd-eks"
                       onClick={() => {
                         setSøgning(e);
+                        søg(e);
                       }}
                     >
                       {e}
@@ -1318,7 +1532,7 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
                   ))}
                 </div>
               )}
-              <div className="vd-gruppe">
+              <div className="vd-gruppe vd-filtre">
                 <span className="vd-etiket">Filtrér</span>
                 <button
                   className="vd-filter"
@@ -1340,9 +1554,7 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
                   </button>
                 ))}
               </div>
-              <span className="vd-taeller">
-                {viste.length} {viste.length === 1 ? "opslag" : "opslag"}
-              </span>
+              <span className="vd-taeller">{tæller}</span>
             </div>
 
             {!klar ? (
@@ -1356,12 +1568,12 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
                 <h3>
                   {resultat
                     ? "Ingen af opslagene dækker det, du søger."
-                    : data.opslag.length === 0
+                    : aktive.length === 0
                     ? "Der er ingen opslag endnu."
                     : "Ingen opslag i det valgte fagområde."}
                 </h3>
                 <p>
-                  {data.opslag.length === 0
+                  {aktive.length === 0
                     ? "Del det første link, så bygger kataloget sig selv op."
                     : "Prøv at skrive behovet med andre ord, eller vælg Alle."}
                 </p>
@@ -1374,6 +1586,7 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
                     post={p}
                     begrundelse={p.begrundelse}
                     navne={data.navne}
+                    ny={p.id === nytId}
                     onSlet={sletOpslag}
                     onRet={retOpslag}
                   />
@@ -1385,9 +1598,25 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
       </main>
 
       <div className="vd-fod">
-        Opslag gemmes i fælles lagring — alle, der åbner siden, ser de samme opslag og kan
-        slette dem.
+        Opslag gemmes i fælles lagring — alle, der åbner siden, ser de samme opslag.
+        {klar && !låst && visning !== "papirkurv" && slettede.length > 0 && (
+          <>
+            {" "}
+            <button onClick={() => setVisning("papirkurv")}>
+              Slettede opslag ({slettede.length})
+            </button>
+          </>
+        )}
       </div>
+
+      {besked && (
+        <div className="vd-besked" role="status">
+          <span>{besked.tekst}</span>
+          {besked.fortryd && (
+            <button onClick={() => gendanOpslag(besked.fortryd)}>Fortryd</button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
