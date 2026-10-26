@@ -125,6 +125,36 @@ function åbnTekst(url) {
   return navn ? `Åbn ${navn}` : "Åbn";
 }
 
+/* Teksten på en links knap: linkets eget navn, hvis det har et, ellers filtypen */
+function knapTekst(link) {
+  if (!link.navn) return åbnTekst(link.url);
+  return `Åbn ${link.navn}${ER_M365.test(link.url) ? " i Teams" : ""}`;
+}
+
+/* Teams-links (teams.microsoft.com/l/…) åbner i browseren. Med msteams:
+   i stedet for https://teams.microsoft.com åbner de i Teams-appen. */
+const ER_TEAMS_LINK = /^https:\/\/teams\.microsoft\.com\/l\//i;
+const tilTeamsAppen = (url) => url.replace(/^https:\/\/teams\.microsoft\.com\//i, "msteams:/");
+
+/* Et opslag kan have flere links, fx slides og optagelse. De ligger i
+   "links"; "url" er altid det første, så ældre opslag og søgning virker. */
+const linksFor = (post) =>
+  Array.isArray(post.links) && post.links.length
+    ? post.links
+    : post.url
+    ? [{ url: post.url, navn: "" }]
+    : [];
+
+/* Renser links fra en formular. Tomme rækker springes over. */
+function rensLinks(rækker) {
+  const links = rækker
+    .map((r) => ({ url: normaliserUrl(r.url), navn: (r.navn || "").trim() }))
+    .filter((r) => r.url);
+  if (links.length === 0) return { fejl: "Indsæt mindst ét link til det, du vil dele." };
+  if (links.some((r) => !erWebadresse(r.url))) return { fejl: URLFEJL };
+  return { links };
+}
+
 /* Links bag et login kan AI'en ikke åbne — så skal filen vedhæftes i stedet */
 const BAG_LOGIN = /sharepoint|onedrive|teams\.microsoft|itslearning|moodle|canvas|wiseflow|intranet|docs\.google|drive\.google/i;
 
@@ -170,6 +200,7 @@ async function hentSideTekst(url) {
    sendes videre. Filen selv gemmes ingen steder — den bliver i Teams. */
 const MAKS_DIREKTE = 3.5 * 1024 * 1024;
 const MAKS_TEKST = 15000;
+const MAKS_SAMLET = 30000; // tekst fra flere filer tilsammen
 
 const ER_PPTX = /\.pptx$/i;
 const ER_DOCX = /\.docx$/i;
@@ -225,18 +256,19 @@ async function udtrækPdf(fil) {
   return sider.join("\n");
 }
 
-/* Svarer enten { tekst } (udtrukket her) eller { blok } (sendes som fil til AI'en) */
-async function læsFil(fil) {
+/* Svarer enten { tekst } (udtrukket her) eller { blok } (sendes som fil til AI'en).
+   "plads" er, hvor meget der er tilbage af de ca. 3,5 MB, der kan sendes som fil. */
+async function læsFil(fil, plads = MAKS_DIREKTE) {
   if (ER_PPTX.test(fil.name) || ER_DOCX.test(fil.name)) {
     return { tekst: (await udtrækOffice(fil)).slice(0, MAKS_TEKST) };
   }
   if (fil.type === "application/pdf") {
-    if (fil.size > MAKS_DIREKTE) return { tekst: (await udtrækPdf(fil)).slice(0, MAKS_TEKST) };
+    if (fil.size > plads) return { tekst: (await udtrækPdf(fil)).slice(0, MAKS_TEKST) };
     const data = await læsSomBase64(fil);
     return { blok: { type: "document", source: { type: "base64", media_type: fil.type, data } } };
   }
-  if (fil.size > MAKS_DIREKTE) {
-    throw new Error("Billedet er for stort. Tag et skærmbillede i lavere opløsning.");
+  if (fil.size > plads) {
+    throw new Error(`Billedet ${fil.name} er for stort. Tag et skærmbillede i lavere opløsning.`);
   }
   const data = await læsSomBase64(fil);
   return { blok: { type: "image", source: { type: "base64", media_type: fil.type, data } } };
@@ -555,6 +587,17 @@ textarea.vd-lang { min-height:150px; font-size:14px; }
 .vd-aabn { display:inline-flex; align-items:center; gap:6px; padding:6px 14px; border-radius:999px;
   background:var(--rod-lys); color:var(--rod-dyb); font-size:13.5px; font-weight:600; text-decoration:none; }
 .vd-aabn:hover { background:#F6DDE1; }
+.vd-links { display:flex; flex-wrap:wrap; gap:8px 10px; align-items:center; margin-top:12px; }
+.vd-teamslink { display:inline-flex; align-items:baseline; gap:8px; }
+.vd-browser { font-size:12px; color:var(--graa); text-decoration:underline; text-underline-offset:3px; }
+.vd-browser:hover { color:var(--rod); }
+.vd-linkrække { display:flex; gap:8px; margin-bottom:8px; }
+.vd-linkurl { flex:2 1 0; min-width:0; }
+.vd-linknavn { flex:1 1 0; min-width:0; }
+.vd-fjern { flex:none; width:44px; border:1.5px solid var(--linje); border-radius:4px;
+  font-size:20px; line-height:1; color:var(--graa); }
+.vd-fjern:hover { border-color:var(--rod); color:var(--rod); }
+.vd-flere { padding:8px 14px; }
 .vd-bemaerk { border-left:2px solid var(--rod); background:var(--rod-lys); color:var(--rod-dyb);
   padding:11px 14px; font-size:14px; margin:-6px 0 20px; }
 .vd-fejl { color:var(--rod-dyb); background:var(--rod-lys); padding:11px 14px;
@@ -592,6 +635,9 @@ textarea.vd-lang { min-height:150px; font-size:14px; }
 }
 @media (max-width:620px) {
   .vd-todelt { grid-template-columns:1fr; }
+  .vd-linkrække { flex-wrap:wrap; padding-bottom:12px; margin-bottom:12px;
+    border-bottom:1px dashed var(--linje); }
+  .vd-linkurl { flex-basis:100%; }
   /* Filtrene på én vandret, rulbar linje i stedet for fem linjer */
   .vd-filtre { flex-wrap:nowrap; overflow-x:auto; width:100%; padding-bottom:4px;
     scrollbar-width:thin; }
@@ -626,6 +672,92 @@ function Pil() {
         strokeLinejoin="round"
       />
     </svg>
+  );
+}
+
+/* Et link, der åbner i Teams-appen, hvis det er et Teams-link — med en lille
+   reserve til browseren, fx på en computer uden appen */
+function TeamsLink({ url, className, children }) {
+  if (!ER_TEAMS_LINK.test(url)) {
+    return (
+      <a className={className} href={url} target="_blank" rel="noopener noreferrer">
+        {children}
+      </a>
+    );
+  }
+  return (
+    <span className="vd-teamslink">
+      <a className={className} href={tilTeamsAppen(url)}>
+        {children}
+      </a>
+      <a className="vd-browser" href={url} target="_blank" rel="noopener noreferrer">
+        eller i browseren
+      </a>
+    </span>
+  );
+}
+
+/* Knapperne på kortet — én pr. link */
+function LinkKnapper({ links }) {
+  const gyldige = links.filter((l) => erWebadresse(l.url));
+  if (gyldige.length === 0) return null;
+  return (
+    <div className="vd-links">
+      {gyldige.map((l, i) => (
+        <TeamsLink key={i} url={l.url} className="vd-aabn">
+          {knapTekst(l)} <span aria-hidden="true">↗</span>
+        </TeamsLink>
+      ))}
+    </div>
+  );
+}
+
+/* Felter til ét eller flere links med et valgfrit navn hver */
+function LinkFelter({ links, onChange, førsteRef }) {
+  const ret = (i, felt, værdi) =>
+    onChange(links.map((l, j) => (j === i ? { ...l, [felt]: værdi } : l)));
+  return (
+    <div className="vd-mark">
+      <span>Links — fx til slides, optagelse eller artikel</span>
+      {links.map((l, i) => (
+        <div key={i} className="vd-linkrække">
+          <input
+            ref={i === 0 ? førsteRef : undefined}
+            className="vd-input vd-linkurl"
+            placeholder="https://"
+            aria-label={`Link ${i + 1}`}
+            value={l.url}
+            onChange={(e) => ret(i, "url", e.target.value)}
+          />
+          <input
+            className="vd-input vd-linknavn"
+            placeholder={i === 0 ? "Navn, fx Slides" : "Navn, fx Optagelse"}
+            aria-label={`Navn på link ${i + 1}, valgfrit`}
+            value={l.navn}
+            onChange={(e) => ret(i, "navn", e.target.value)}
+          />
+          {links.length > 1 && (
+            <button
+              className="vd-fjern"
+              aria-label={`Fjern link ${i + 1}`}
+              title="Fjern linket"
+              onClick={() => onChange(links.filter((_, j) => j !== i))}
+            >
+              ×
+            </button>
+          )}
+        </div>
+      ))}
+      <button
+        className="vd-tilfoej vd-flere"
+        onClick={() => onChange([...links, { url: "", navn: "" }])}
+      >
+        + Tilføj endnu et link
+      </button>
+      <span className="vd-hjaelp">
+        Navnet er valgfrit og står på knappen. Uden navn viser knappen filtypen.
+      </span>
+    </div>
   );
 }
 
@@ -738,23 +870,19 @@ function Opslag({ post, begrundelse, navne, ny, onSlet, onRet }) {
               />
             </label>
           </div>
-          <label className="vd-mark">
-            <span>Link</span>
-            <input
-              className="vd-input"
-              value={udkast.url}
-              onChange={(e) => setUdkast({ ...udkast, url: e.target.value })}
-            />
-          </label>
-          {retfejl && <div className="vd-fejl">{retfejl}</div>}
+          <LinkFelter
+            links={udkast.links}
+            onChange={(links) => setUdkast({ ...udkast, links })}
+          />
+          {retfejl && <div className="vd-fejl" role="alert">{retfejl}</div>}
           <div className="vd-handling" style={{ marginTop: 4 }}>
             <button
               className="vd-knap"
               onClick={() => {
-                const link = normaliserUrl(udkast.url);
-                if (!erWebadresse(link)) return setRetfejl(URLFEJL);
+                const renset = rensLinks(udkast.links);
+                if (renset.fejl) return setRetfejl(renset.fejl);
                 setRetfejl("");
-                onRet({ ...post, ...udkast, url: link });
+                onRet({ ...post, ...udkast, links: renset.links, url: renset.links[0].url });
                 setUdkast(null);
               }}
             >
@@ -806,13 +934,7 @@ function Opslag({ post, begrundelse, navne, ny, onSlet, onRet }) {
           <Pil />
         </button>
       )}
-      {erWebadresse(post.url) && (
-        <div style={{ marginTop: 12 }}>
-          <a className="vd-aabn" href={post.url} target="_blank" rel="noopener noreferrer">
-            {åbnTekst(post.url)} <span aria-hidden="true">↗</span>
-          </a>
-        </div>
-      )}
+      <LinkKnapper links={linksFor(post)} />
       <div className="vd-meta">
         <span className="vd-chip" style={{ color: farveFor(post.kategori) }}>
           <span className="vd-prik" style={{ background: farveFor(post.kategori) }} />
@@ -841,7 +963,7 @@ function Opslag({ post, begrundelse, navne, ny, onSlet, onRet }) {
                   type: post.type,
                   navn: post.navn,
                   dato: post.dato,
-                  url: post.url,
+                  links: linksFor(post).map((l) => ({ ...l })),
                 })
               }
             >
@@ -921,7 +1043,7 @@ function Adgangskode({ forkert, onIndsend }) {
 /* ------------------------------------------------------------------ */
 
 function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
-  const [url, setUrl] = useState("");
+  const [links, setLinks] = useState([{ url: "", navn: "" }]);
   const [navn, setNavn] = useState(() => {
     const mit = hentMitNavn();
     return navne.includes(mit) ? mit : navne[0] || "";
@@ -929,7 +1051,7 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
   const [dato, setDato] = useState(idag());
   const [note, setNote] = useState("");
   const [transskription, setTransskription] = useState("");
-  const [fil, setFil] = useState(null);
+  const [filer, setFiler] = useState([]);
   const [fejl, setFejl] = useState("");
   const [arbejder, setArbejder] = useState(false);
   const [udkast, setUdkast] = useState(null);
@@ -952,63 +1074,79 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
 
   async function analyser() {
     setFejl("");
-    if (!url.trim()) return setFejl("Indsæt et link til det, du vil dele.");
-    const link = normaliserUrl(url);
-    if (!erWebadresse(link)) return setFejl(URLFEJL);
-    if (link !== url) setUrl(link);
+    const renset = rensLinks(links);
+    if (renset.fejl) return setFejl(renset.fejl);
+    const liste = renset.links;
+    setLinks(liste);
     if (!navn) return setFejl("Vælg dit navn på listen.");
     setArbejder(true);
 
-    const bagLogin = BAG_LOGIN.test(link);
-    if (bagLogin && !fil && !transskription.trim() && !note.trim()) {
+    const hoved = liste[0].url;
+    const offentligt = liste.find((l) => !BAG_LOGIN.test(l.url));
+    const bagLogin = !offentligt; // alle links kræver login
+    if (bagLogin && filer.length === 0 && !transskription.trim() && !note.trim()) {
       setArbejder(false);
       return setFejl(
-        "AI'en kan ikke åbne filer bag skolens login. Vedhæft den samme fil nedenfor, indsæt et par afsnit fra den, eller skriv en note om, hvad den handler om."
+        "AI'en kan ikke åbne filer bag skolens login. Vedhæft de samme filer nedenfor, indsæt et par afsnit fra dem, eller skriv en note om, hvad de handler om."
       );
     }
 
-    /* En vedhæftet fil læses først. PowerPoint, Word og store PDF'er bliver
-       til tekst her i browseren; små PDF'er og billeder sendes som fil. */
-    let filTekst = "";
-    let filBlok = null;
-    if (fil) {
+    /* Vedhæftede filer læses først. PowerPoint, Word og store PDF'er bliver
+       til tekst her i browseren; små PDF'er og billeder sendes som fil, så
+       længe de tilsammen holder sig under grænsen for ét kald. */
+    const filTekster = [];
+    const filBlokke = [];
+    let plads = MAKS_DIREKTE;
+    for (const fil of filer) {
+      let læst;
       try {
-        const læst = await læsFil(fil);
-        filTekst = (læst.tekst || "").trim();
-        filBlok = læst.blok || null;
+        læst = await læsFil(fil, plads);
       } catch (e) {
         setArbejder(false);
         return setFejl(
           /^Billedet/.test(e.message)
             ? e.message
-            : `${fil.name} kunne ikke læses. Indsæt i stedet et par afsnit fra filen i tekstfeltet.`
+            : `${fil.name} kunne ikke læses. Fjern den, eller indsæt et par afsnit fra den i tekstfeltet.`
         );
       }
-      if (!filTekst && !filBlok) {
+      const tekst = (læst.tekst || "").trim();
+      if (læst.blok) {
+        filBlokke.push(læst.blok);
+        plads -= fil.size;
+      } else if (tekst) {
+        filTekster.push(filer.length > 1 ? `Fra ${fil.name}:\n${tekst}` : tekst);
+      } else {
         setArbejder(false);
         return setFejl(
-          `Der er ingen tekst i ${fil.name}, som AI'en kan læse — måske er den scannet. Indsæt teksten selv, eller beskriv filen i noten.`
+          `Der er ingen tekst i ${fil.name}, som AI'en kan læse — måske er den scannet. Fjern den, indsæt teksten selv, eller beskriv filen i noten.`
         );
       }
     }
+    const filTekst = filTekster.join("\n\n");
+    const filnavne = filer.map((f) => f.name).join(", ");
 
     let tekstKilde = [transskription.trim(), filTekst]
       .filter(Boolean)
       .join("\n\n")
-      .slice(0, MAKS_TEKST);
-    const yt = await hentYouTubeInfo(link);
+      .slice(0, MAKS_SAMLET);
+    const ytLink = liste.find((l) => ER_YOUTUBE.test(l.url));
+    const yt = ytLink ? await hentYouTubeInfo(ytLink.url) : null;
 
-    /* Er der hverken fil eller indsat tekst, så prøv at hente siden på serveren */
+    /* Er der hverken fil eller indsat tekst, så prøv at hente det første
+       offentlige link på serveren */
     let side = null;
-    if (!filBlok && !tekstKilde && !bagLogin) {
-      side = await hentSideTekst(link);
+    if (!filBlokke.length && !tekstKilde && offentligt) {
+      side = await hentSideTekst(offentligt.url);
       if (side) tekstKilde = side.tekst.slice(0, 12000);
     }
 
-    const kilde = filBlok
-      ? `Kollegaen har vedhæftet selve filen (${fil.name}). Byg titel, fagområde og opsummering på filens faktiske indhold.`
+    const flere = filer.length > 1;
+    const kilde = filBlokke.length
+      ? `Kollegaen har vedhæftet ${flere ? "filerne" : "selve filen"} (${filnavne})${
+          filTekst ? ", og teksten fra nogle af dem står nedenfor" : ""
+        }. Byg titel, fagområde og opsummering på det faktiske indhold.`
       : filTekst
-      ? `Nedenfor står teksten fra den vedhæftede fil (${fil.name})${
+      ? `Nedenfor står teksten fra ${flere ? "de vedhæftede filer" : "den vedhæftede fil"} (${filnavne})${
           transskription.trim() ? " og den tekst, kollegaen har indsat" : ""
         }. Byg titel, fagområde og opsummering på den. Søg ikke.`
       : side
@@ -1016,19 +1154,26 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
       : tekstKilde
       ? `Nedenfor står tekst, som kollegaen har indsat fra kilden, fx en transskription. Byg opsummeringen på den — det er dit primære grundlag. Søg ikke.`
       : bagLogin
-      ? `Linket peger på en fil bag skolens login, som du ikke kan åbne. Søg ikke, og find aldrig på indhold. Byg titel og opsummering på kollegaens note, og indled opsummeringen med "Kunne ikke læses automatisk."`
-      : `Slå linket op på nettet, hvis siden er offentligt tilgængelig. Søg højst én gang. Kan du ikke komme ind — fordi siden kræver login, eller fordi indholdet er en video eller podcast, du hverken kan se eller høre — så find aldrig på indhold. Skriv i stedet en opsummering, der bygger på kollegaens note, og indled den med "Kunne ikke læses automatisk."`;
-    const format = filformat(link);
+      ? `Linkene peger på filer bag skolens login, som du ikke kan åbne. Søg ikke, og find aldrig på indhold. Byg titel og opsummering på kollegaens note, og indled opsummeringen med "Kunne ikke læses automatisk."`
+      : `Slå ${offentligt.url} op på nettet, hvis siden er offentligt tilgængelig. Søg højst én gang. Kan du ikke komme ind — fordi siden kræver login, eller fordi indholdet er en video eller podcast, du hverken kan se eller høre — så find aldrig på indhold. Skriv i stedet en opsummering, der bygger på kollegaens note, og indled den med "Kunne ikke læses automatisk."`;
+    const linkliste = liste
+      .map((l, i) => {
+        const format = filformat(l.url);
+        const ekstra = [l.navn, format && `filtype: ${format}`].filter(Boolean).join(", ");
+        return `${liste.length > 1 ? `${i + 1}. ` : ""}${l.url}${ekstra ? ` (${ekstra})` : ""}`;
+      })
+      .join("\n");
 
     const opgave = `Du hjælper undervisere på Markedsføringsøkonom-uddannelsen på et dansk erhvervsakademi med at katalogisere delt viden.
 
-Link: ${link}${
+${liste.length > 1 ? "Links" : "Link"}:
+${linkliste}${
       yt
-        ? `\nKildens rigtige titel: "${yt.titel}"${yt.kanal ? ` (kanal: ${yt.kanal})` : ""}`
+        ? `\nVideoens rigtige titel: "${yt.titel}"${yt.kanal ? ` (kanal: ${yt.kanal})` : ""}`
         : side && side.titel
         ? `\nSidens egen titel: "${side.titel}"`
         : ""
-    }${format ? `\nFiltype ifølge linket: ${format}` : ""}
+    }
 Kollegaens egen note: ${note.trim() || "(ingen)"}
 
 ${kilde}
@@ -1037,8 +1182,8 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
 {"titel":"kort sigende titel på dansk, max 12 ord","kategori":"et af: ${FAGLISTE}","type":"et af: ${TYPER.join(", ")}","opsummering":"2-3 sætninger på dansk i almindeligt sprog, der fortæller en underviser hvad det handler om, og hvad det kan bruges til"}`;
 
     try {
-      const indhold = filBlok ? [filBlok, { type: "text", text: opgave }] : opgave;
-      const brugSøgning = !filBlok && !tekstKilde && !bagLogin;
+      const indhold = filBlokke.length ? [...filBlokke, { type: "text", text: opgave }] : opgave;
+      const brugSøgning = !filBlokke.length && !tekstKilde && !bagLogin;
       let svar = await spørgClaude(indhold, brugSøgning);
       let j = udtrækJson(svar);
       if (!j && brugSøgning) {
@@ -1048,11 +1193,11 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
       }
       j = j || {};
       setUdkast({
-        titel: j.titel || (yt && yt.titel) || (side && side.titel) || pænUrl(link),
+        titel: j.titel || (yt && yt.titel) || (side && side.titel) || pænUrl(hoved),
         kategori: FAGOMRAADER.some((f) => f.navn === j.kategori)
           ? j.kategori
           : "Markedsføring",
-        type: TYPER.includes(j.type) ? j.type : gætType(link),
+        type: TYPER.includes(j.type) ? j.type : gætType(hoved),
         opsummering: j.opsummering || note.trim() || "",
       });
       if (!j.opsummering) {
@@ -1062,9 +1207,9 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
       }
     } catch (e) {
       setUdkast({
-        titel: (yt && yt.titel) || pænUrl(link),
+        titel: (yt && yt.titel) || pænUrl(hoved),
         kategori: "Markedsføring",
-        type: gætType(link),
+        type: gætType(hoved),
         opsummering: note.trim() || "",
       });
       setFejl(
@@ -1132,9 +1277,11 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
             className="vd-knap"
             onClick={() => {
               gemMitNavn(navn);
+              const gemte = rensLinks(links).links;
               onGem({
                 id: `p${Date.now()}${Math.floor(Math.random() * 999)}`,
-                url: normaliserUrl(url),
+                url: gemte[0].url,
+                links: gemte,
                 navn,
                 dato,
                 ...udkast,
@@ -1163,26 +1310,16 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
       <div className="vd-tip">
         <b>Har du selv filen?</b> En video, PowerPoint eller PDF fra en konference eller et
         webinar lægges i mappen <i>Videndeling</i> under <i>Filer</i> i Teams-kanalen. Vælg{" "}
-        <i>Del → Kopiér link</i> på filen og indsæt linket her.
+        <i>Del → Kopiér link</i> på filen og indsæt linket her. Hører der flere filer til,
+        fx slides og optagelse, så tilføj et link til hver.
         {TEAMS_MAPPE && (
-          <>
-            {" "}
-            <a href={TEAMS_MAPPE} target="_blank" rel="noopener noreferrer">
-              Åbn mappen i Teams ↗
-            </a>
-          </>
+          <div style={{ marginTop: 8 }}>
+            <TeamsLink url={TEAMS_MAPPE}>Åbn mappen i Teams ↗</TeamsLink>
+          </div>
         )}
       </div>
 
-      <label className="vd-mark">
-        <span>Link til filen i Teams, eller til en side, podcast eller video</span>
-        <input
-          className="vd-input"
-          placeholder="https://"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-        />
-      </label>
+      <LinkFelter links={links} onChange={setLinks} />
 
       <div className="vd-todelt">
         <label className="vd-mark">
@@ -1232,33 +1369,35 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
       </div>
 
       <label className="vd-mark">
-        <span>Vedhæft samme fil — så kan AI'en læse den</span>
+        <span>Vedhæft de samme filer — så kan AI'en læse dem</span>
         <input
           type="file"
+          multiple
           accept=".pdf,.pptx,.docx,application/pdf,image/png,image/jpeg,image/webp"
           className="vd-input vd-filfelt"
           onChange={(e) => {
-            const f = e.target.files && e.target.files[0];
             setFejl("");
-            setFil(f || null);
+            setFiler([...(e.target.files || [])]);
           }}
         />
         <span className="vd-hjaelp">
-          {fil
-            ? `${fil.name} læses kun til opsummeringen og gemmes ikke her — filen bliver i Teams.`
-            : "PowerPoint, Word, PDF eller billede. Linket er det, kollegerne klikker på."}
+          {filer.length
+            ? `${filer.map((f) => f.name).join(", ")} læses kun til opsummeringen og gemmes ikke her — filerne bliver i Teams.`
+            : "PowerPoint, Word, PDF eller billede — vælg gerne flere. Linkene er det, kollegerne klikker på."}
         </span>
       </label>
 
-      {!fil && ER_M365.test(url) && (
+      {!filer.length && links.some((l) => ER_M365.test(l.url)) && (
         <div className="vd-bemaerk">
           Linket peger på en fil i Teams. AI'en kan ikke åbne den bag skolens login —
           vedhæft den samme fil ovenfor, så kan AI'en læse den.
-          {filformat(url) === "Video" &&
+          {links.some((l) => ER_M365.test(l.url) && filformat(l.url) === "Video") &&
             " Er det en video, så åbn den i Teams og kopiér transskriptionen ind i tekstfeltet nedenfor, hvis der er en."}
         </div>
       )}
-      {!fil && !ER_M365.test(url) && BAG_LOGIN.test(url) && (
+      {!filer.length &&
+        !links.some((l) => ER_M365.test(l.url)) &&
+        links.some((l) => BAG_LOGIN.test(l.url)) && (
         <div className="vd-bemaerk">
           Linket ligger på et drev, der kræver login. AI'en bliver mødt af en loginskærm og
           kan ikke se indholdet — vedhæft filen ovenfor, eller beskriv den i noten.
@@ -1280,7 +1419,7 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
         </span>
       </label>
 
-      {!fil && !transskription.trim() && ER_YOUTUBE.test(url) && (
+      {!filer.length && !transskription.trim() && links.some((l) => ER_YOUTUBE.test(l.url)) && (
         <div className="vd-bemaerk">
           AI'en kan hverken se eller høre videoen. Åbn transskriptionen på YouTube under
           "Vis udskrift", kopiér den og indsæt den i feltet ovenfor — så bliver
@@ -1302,8 +1441,10 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
         {arbejder ? (
           <Status
             tekst={
-              fil
-                ? "Læser den vedhæftede fil…"
+              filer.length
+                ? filer.length > 1
+                  ? "Læser de vedhæftede filer…"
+                  : "Læser den vedhæftede fil…"
                 : transskription.trim()
                 ? "Læser den indsatte tekst…"
                 : "Henter siden og skriver opsummering…"
