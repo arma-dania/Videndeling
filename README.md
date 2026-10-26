@@ -100,6 +100,22 @@ Netlify sætter ikke restriktive headers på siden, så den kan vises i en
 iframe uden yderligere opsætning — I skal blot undgå selv at tilføje en
 `X-Frame-Options`- eller CSP-header, der blokerer det.
 
+## Filer i Teams
+
+Selve filerne (videoer, PowerPoints, PDF'er osv.) gemmes ikke på siden, men i
+Teams-kanalens fane **Filer**, i en mappe med navnet *Videndeling*. Kortet på
+siden linker til filen, og knappen viser filtypen, fx "Åbn PowerPoint i
+Teams".
+
+- **Link til mappen i formularen (valgfrit):** Åbn mappen i Teams, vælg
+  *Kopiér link*, og tilføj linket i Netlify under Environment variables som
+  `VITE_TEAMS_MAPPE`. Udgiv derefter siden igen. Formularen viser så et link
+  direkte til mappen.
+- **AI'en og filer bag login:** AI'en kan ikke åbne filer bag skolens login.
+  Vedhæftes den samme fil i formularen, læses PowerPoint, Word og PDF'er over
+  3,5 MB i browseren, og kun teksten sendes til AI'en. Mindre PDF'er og
+  billeder sendes direkte. Filen gemmes ingen steder af siden.
+
 ## Sådan gemmes data
 
 - Hvert opslag ligger under sin egen nøgle (`vidensdeling:opslag:<id>`) i
