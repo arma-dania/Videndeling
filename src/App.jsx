@@ -19,7 +19,11 @@ const FAGOMRAADER = [
 
 const FAGLISTE = FAGOMRAADER.map((f) => f.navn).join(", ");
 
-const TYPER = ["Dokument", "Podcast", "Video"];
+const TYPER = ["Dokument", "Præsentation", "Podcast", "Video"];
+
+/* Link til kanalens "Videndeling"-mappe i Teams. Sættes i Netlify som
+   miljøvariablen VITE_TEAMS_MAPPE; uden den vises vejledningen uden link. */
+const TEAMS_MAPPE = import.meta.env.VITE_TEAMS_MAPPE || "";
 
 /* Startliste — nye navne kan tilføjes i appen */
 const STANDARDNAVNE = [
@@ -58,6 +62,9 @@ const visDato = (iso) => {
 
 function gætType(url) {
   const u = (url || "").toLowerCase();
+  const format = filformat(url);
+  if (format === "PowerPoint") return "Præsentation";
+  if (format === "Video") return "Video";
   if (/youtube|youtu\.be|vimeo|\.mp4|video/.test(u)) return "Video";
   if (/spotify|podcast|soundcloud|apple\.com\/.*podcast|\.mp3|anchor\.fm/.test(u))
     return "Podcast";
@@ -89,6 +96,33 @@ function pænUrl(url) {
   } catch {
     return url;
   }
+}
+
+/* Links til filer i Teams, SharePoint og OneDrive */
+const ER_M365 = /sharepoint\.com|teams\.microsoft\.com|onedrive\.live\.com|1drv\.ms/i;
+
+/* SharePoints delingslinks fortæller filtypen med et bogstav: /:p:/ er en
+   PowerPoint, /:v:/ en video osv. Ellers bruges filendelsen. */
+const DELINGSKODER = { w: "Word", x: "Excel", p: "PowerPoint", b: "PDF", v: "Video", f: "Mappe", i: "Billede" };
+const ENDELSER = {
+  pptx: "PowerPoint", ppt: "PowerPoint", docx: "Word", doc: "Word", xlsx: "Excel",
+  pdf: "PDF", mp4: "Video", mov: "Video", m4v: "Video", mp3: "Lyd", m4a: "Lyd",
+};
+
+function filformat(url) {
+  const u = url || "";
+  const kode = u.match(/\/:([a-z]):\//i);
+  if (kode && ER_M365.test(u)) return DELINGSKODER[kode[1].toLowerCase()] || "";
+  const endelse = u.split(/[?#]/)[0].match(/\.([a-z0-9]{2,4})$/i);
+  return endelse ? ENDELSER[endelse[1].toLowerCase()] || "" : "";
+}
+
+/* Teksten på kortets knap, fx "Åbn PowerPoint i Teams" */
+function åbnTekst(url) {
+  const format = filformat(url);
+  const navn = { Video: "videoen", Mappe: "mappen", Billede: "billedet", Lyd: "lydfilen" }[format] || format;
+  if (ER_M365.test(url)) return navn ? `Åbn ${navn} i Teams` : "Åbn i Teams";
+  return navn ? `Åbn ${navn}` : "Åbn";
 }
 
 /* Links bag et login kan AI'en ikke åbne — så skal filen vedhæftes i stedet */
@@ -125,6 +159,87 @@ async function hentSideTekst(url) {
   } catch {
     return null;
   }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Læsning af vedhæftede filer                                        */
+/* ------------------------------------------------------------------ */
+
+/* En Netlify-funktion tager højst ca. 6 MB ind. Større PDF'er og alle
+   PowerPoint- og Word-filer læses derfor her i browseren, og kun teksten
+   sendes videre. Filen selv gemmes ingen steder — den bliver i Teams. */
+const MAKS_DIREKTE = 3.5 * 1024 * 1024;
+const MAKS_TEKST = 15000;
+
+const ER_PPTX = /\.pptx$/i;
+const ER_DOCX = /\.docx$/i;
+
+/* Tekst fra Office-XML: hvert afsnit (<a:p> / <w:p>) bliver én linje */
+function tekstFraXml(xml) {
+  const doc = new DOMParser().parseFromString(xml, "application/xml");
+  return [...doc.getElementsByTagNameNS("*", "p")]
+    .map((p) =>
+      [...p.getElementsByTagNameNS("*", "t")].map((t) => t.textContent).join("")
+    )
+    .filter((linje) => linje.trim())
+    .join("\n");
+}
+
+async function udtrækOffice(fil) {
+  const { default: JSZip } = await import("jszip");
+  const zip = await JSZip.loadAsync(fil);
+  const læs = (navn) => (zip.file(navn) ? zip.file(navn).async("string") : "");
+
+  if (ER_DOCX.test(fil.name)) return tekstFraXml(await læs("word/document.xml"));
+
+  // PowerPoint: diasene i rækkefølge, med talernoter hvor de findes
+  const nr = (navn) => Number((navn.match(/(\d+)\.xml$/) || [])[1] || 0);
+  const dias = Object.keys(zip.files)
+    .filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n))
+    .sort((a, b) => nr(a) - nr(b));
+  const dele = [];
+  for (const [i, navn] of dias.entries()) {
+    const tekst = tekstFraXml(await læs(navn));
+    const rel = await læs(navn.replace("slides/", "slides/_rels/") + ".rels");
+    const note = rel.match(/notesSlides\/(notesSlide\d+\.xml)/);
+    const noter = note ? tekstFraXml(await læs(`ppt/notesSlides/${note[1]}`)) : "";
+    if (tekst || noter) {
+      dele.push(`Dias ${i + 1}:\n${tekst}${noter ? `\nNoter: ${noter}` : ""}`);
+    }
+    if (dele.join("").length > MAKS_TEKST) break;
+  }
+  return dele.join("\n\n");
+}
+
+async function udtrækPdf(fil) {
+  const pdfjs = await import("pdfjs-dist");
+  const { default: arbejder } = await import("pdfjs-dist/build/pdf.worker.min.mjs?url");
+  pdfjs.GlobalWorkerOptions.workerSrc = arbejder;
+  const pdf = await pdfjs.getDocument({ data: await fil.arrayBuffer() }).promise;
+  const sider = [];
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const indhold = await (await pdf.getPage(i)).getTextContent();
+    sider.push(indhold.items.map((x) => x.str).join(" "));
+    if (sider.join("").length > MAKS_TEKST) break;
+  }
+  return sider.join("\n");
+}
+
+/* Svarer enten { tekst } (udtrukket her) eller { blok } (sendes som fil til AI'en) */
+async function læsFil(fil) {
+  if (ER_PPTX.test(fil.name) || ER_DOCX.test(fil.name)) {
+    return { tekst: (await udtrækOffice(fil)).slice(0, MAKS_TEKST) };
+  }
+  if (fil.type === "application/pdf") {
+    if (fil.size > MAKS_DIREKTE) return { tekst: (await udtrækPdf(fil)).slice(0, MAKS_TEKST) };
+    const data = await læsSomBase64(fil);
+    return { blok: { type: "document", source: { type: "base64", media_type: fil.type, data } } };
+  }
+  if (fil.size > MAKS_DIREKTE) {
+    throw new Error("Billedet er for stort. Tag et skærmbillede i lavere opløsning.");
+  }
+  const data = await læsSomBase64(fil);
+  return { blok: { type: "image", source: { type: "base64", media_type: fil.type, data } } };
 }
 
 function læsSomBase64(fil) {
@@ -432,8 +547,14 @@ textarea.vd-lang { min-height:150px; font-size:14px; }
 .vd-filfelt::file-selector-button { font:inherit; font-weight:600; border:1px solid var(--linje);
   background:#fff; color:var(--rod-dyb); padding:6px 13px; border-radius:3px; margin-right:12px; cursor:pointer; }
 .vd-filfelt::file-selector-button:hover { border-color:var(--rod); }
-.vd-hjaelp { display:block; margin-top:7px; font-size:13px; color:var(--graa);
+.vd-mark > .vd-hjaelp, .vd-hjaelp { display:block; margin-top:7px; font-size:13px; color:var(--graa);
   font-family:system-ui,sans-serif; letter-spacing:0; text-transform:none; }
+.vd-tip { border:1px solid var(--linje); border-radius:4px; padding:12px 14px; font-size:14px;
+  color:#40383D; margin:0 0 22px; }
+.vd-tip a { color:var(--rod-dyb); font-weight:600; white-space:nowrap; }
+.vd-aabn { display:inline-flex; align-items:center; gap:6px; padding:6px 14px; border-radius:999px;
+  background:var(--rod-lys); color:var(--rod-dyb); font-size:13.5px; font-weight:600; text-decoration:none; }
+.vd-aabn:hover { background:#F6DDE1; }
 .vd-bemaerk { border-left:2px solid var(--rod); background:var(--rod-lys); color:var(--rod-dyb);
   padding:11px 14px; font-size:14px; margin:-6px 0 20px; }
 .vd-fejl { color:var(--rod-dyb); background:var(--rod-lys); padding:11px 14px;
@@ -685,6 +806,13 @@ function Opslag({ post, begrundelse, navne, ny, onSlet, onRet }) {
           <Pil />
         </button>
       )}
+      {erWebadresse(post.url) && (
+        <div style={{ marginTop: 12 }}>
+          <a className="vd-aabn" href={post.url} target="_blank" rel="noopener noreferrer">
+            {åbnTekst(post.url)} <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+      )}
       <div className="vd-meta">
         <span className="vd-chip" style={{ color: farveFor(post.kategori) }}>
           <span className="vd-prik" style={{ background: farveFor(post.kategori) }} />
@@ -831,21 +959,66 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
     if (!navn) return setFejl("Vælg dit navn på listen.");
     setArbejder(true);
 
-    let tekstKilde = transskription.trim().slice(0, 12000);
+    const bagLogin = BAG_LOGIN.test(link);
+    if (bagLogin && !fil && !transskription.trim() && !note.trim()) {
+      setArbejder(false);
+      return setFejl(
+        "AI'en kan ikke åbne filer bag skolens login. Vedhæft den samme fil nedenfor, indsæt et par afsnit fra den, eller skriv en note om, hvad den handler om."
+      );
+    }
+
+    /* En vedhæftet fil læses først. PowerPoint, Word og store PDF'er bliver
+       til tekst her i browseren; små PDF'er og billeder sendes som fil. */
+    let filTekst = "";
+    let filBlok = null;
+    if (fil) {
+      try {
+        const læst = await læsFil(fil);
+        filTekst = (læst.tekst || "").trim();
+        filBlok = læst.blok || null;
+      } catch (e) {
+        setArbejder(false);
+        return setFejl(
+          /^Billedet/.test(e.message)
+            ? e.message
+            : `${fil.name} kunne ikke læses. Indsæt i stedet et par afsnit fra filen i tekstfeltet.`
+        );
+      }
+      if (!filTekst && !filBlok) {
+        setArbejder(false);
+        return setFejl(
+          `Der er ingen tekst i ${fil.name}, som AI'en kan læse — måske er den scannet. Indsæt teksten selv, eller beskriv filen i noten.`
+        );
+      }
+    }
+
+    let tekstKilde = [transskription.trim(), filTekst]
+      .filter(Boolean)
+      .join("\n\n")
+      .slice(0, MAKS_TEKST);
     const yt = await hentYouTubeInfo(link);
 
     /* Er der hverken fil eller indsat tekst, så prøv at hente siden på serveren */
     let side = null;
-    if (!fil && !tekstKilde && !BAG_LOGIN.test(link)) {
+    if (!filBlok && !tekstKilde && !bagLogin) {
       side = await hentSideTekst(link);
       if (side) tekstKilde = side.tekst.slice(0, 12000);
     }
 
-    const kilde = fil
+    const kilde = filBlok
       ? `Kollegaen har vedhæftet selve filen (${fil.name}). Byg titel, fagområde og opsummering på filens faktiske indhold.`
-      : tekstKilde
+      : filTekst
+      ? `Nedenfor står teksten fra den vedhæftede fil (${fil.name})${
+          transskription.trim() ? " og den tekst, kollegaen har indsat" : ""
+        }. Byg titel, fagområde og opsummering på den. Søg ikke.`
+      : side
       ? `Nedenfor står teksten fra kilden. Byg opsummeringen på den — det er dit primære grundlag. Søg ikke. Teksten er hentet råt fra en webside, så se bort fra menupunkter, cookiebeskeder, kontaktoplysninger og gentagelser.`
+      : tekstKilde
+      ? `Nedenfor står tekst, som kollegaen har indsat fra kilden, fx en transskription. Byg opsummeringen på den — det er dit primære grundlag. Søg ikke.`
+      : bagLogin
+      ? `Linket peger på en fil bag skolens login, som du ikke kan åbne. Søg ikke, og find aldrig på indhold. Byg titel og opsummering på kollegaens note, og indled opsummeringen med "Kunne ikke læses automatisk."`
       : `Slå linket op på nettet, hvis siden er offentligt tilgængelig. Søg højst én gang. Kan du ikke komme ind — fordi siden kræver login, eller fordi indholdet er en video eller podcast, du hverken kan se eller høre — så find aldrig på indhold. Skriv i stedet en opsummering, der bygger på kollegaens note, og indled den med "Kunne ikke læses automatisk."`;
+    const format = filformat(link);
 
     const opgave = `Du hjælper undervisere på Markedsføringsøkonom-uddannelsen på et dansk erhvervsakademi med at katalogisere delt viden.
 
@@ -855,31 +1028,17 @@ Link: ${link}${
         : side && side.titel
         ? `\nSidens egen titel: "${side.titel}"`
         : ""
-    }
+    }${format ? `\nFiltype ifølge linket: ${format}` : ""}
 Kollegaens egen note: ${note.trim() || "(ingen)"}
 
 ${kilde}
 ${tekstKilde ? `\nTekst fra kilden:\n"""\n${tekstKilde}\n"""\n` : ""}
 Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen markdown:
-{"titel":"kort sigende titel på dansk, max 12 ord","kategori":"et af: ${FAGLISTE}","type":"et af: Dokument, Podcast, Video","opsummering":"2-3 sætninger på dansk i almindeligt sprog, der fortæller en underviser hvad det handler om, og hvad det kan bruges til"}`;
+{"titel":"kort sigende titel på dansk, max 12 ord","kategori":"et af: ${FAGLISTE}","type":"et af: ${TYPER.join(", ")}","opsummering":"2-3 sætninger på dansk i almindeligt sprog, der fortæller en underviser hvad det handler om, og hvad det kan bruges til"}`;
 
     try {
-      let indhold = opgave;
-      if (fil) {
-        const b64 = await læsSomBase64(fil);
-        const blok =
-          fil.type === "application/pdf"
-            ? {
-                type: "document",
-                source: { type: "base64", media_type: "application/pdf", data: b64 },
-              }
-            : {
-                type: "image",
-                source: { type: "base64", media_type: fil.type, data: b64 },
-              };
-        indhold = [blok, { type: "text", text: opgave }];
-      }
-      const brugSøgning = !fil && !tekstKilde;
+      const indhold = filBlok ? [filBlok, { type: "text", text: opgave }] : opgave;
+      const brugSøgning = !filBlok && !tekstKilde && !bagLogin;
       let svar = await spørgClaude(indhold, brugSøgning);
       let j = udtrækJson(svar);
       if (!j && brugSøgning) {
@@ -1001,8 +1160,22 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
       </p>
       {fejl && <div className="vd-fejl" role="alert">{fejl}</div>}
 
+      <div className="vd-tip">
+        <b>Har du selv filen?</b> En video, PowerPoint eller PDF fra en konference eller et
+        webinar lægges i mappen <i>Videndeling</i> under <i>Filer</i> i Teams-kanalen. Vælg{" "}
+        <i>Del → Kopiér link</i> på filen og indsæt linket her.
+        {TEAMS_MAPPE && (
+          <>
+            {" "}
+            <a href={TEAMS_MAPPE} target="_blank" rel="noopener noreferrer">
+              Åbn mappen i Teams ↗
+            </a>
+          </>
+        )}
+      </div>
+
       <label className="vd-mark">
-        <span>Link til dokument, podcast eller video</span>
+        <span>Link til filen i Teams, eller til en side, podcast eller video</span>
         <input
           className="vd-input"
           placeholder="https://"
@@ -1059,31 +1232,33 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
       </div>
 
       <label className="vd-mark">
-        <span>Vedhæft filen — så kan AI'en læse den</span>
+        <span>Vedhæft samme fil — så kan AI'en læse den</span>
         <input
           type="file"
-          accept="application/pdf,image/png,image/jpeg,image/webp"
+          accept=".pdf,.pptx,.docx,application/pdf,image/png,image/jpeg,image/webp"
           className="vd-input vd-filfelt"
           onChange={(e) => {
             const f = e.target.files && e.target.files[0];
-            if (!f) return setFil(null);
-            if (f.size > 20 * 1024 * 1024) {
-              setFil(null);
-              setFejl("Filen er over 20 MB. Skriv en note i stedet.");
-              return;
-            }
             setFejl("");
-            setFil(f);
+            setFil(f || null);
           }}
         />
         <span className="vd-hjaelp">
           {fil
-            ? `${fil.name} følger med til analysen. Filen bliver ikke gemt — kun linket.`
-            : "PDF eller billede. Linket er stadig det, kollegerne klikker på."}
+            ? `${fil.name} læses kun til opsummeringen og gemmes ikke her — filen bliver i Teams.`
+            : "PowerPoint, Word, PDF eller billede. Linket er det, kollegerne klikker på."}
         </span>
       </label>
 
-      {!fil && BAG_LOGIN.test(url) && (
+      {!fil && ER_M365.test(url) && (
+        <div className="vd-bemaerk">
+          Linket peger på en fil i Teams. AI'en kan ikke åbne den bag skolens login —
+          vedhæft den samme fil ovenfor, så kan AI'en læse den.
+          {filformat(url) === "Video" &&
+            " Er det en video, så åbn den i Teams og kopiér transskriptionen ind i tekstfeltet nedenfor, hvis der er en."}
+        </div>
+      )}
+      {!fil && !ER_M365.test(url) && BAG_LOGIN.test(url) && (
         <div className="vd-bemaerk">
           Linket ligger på et drev, der kræver login. AI'en bliver mødt af en loginskærm og
           kan ikke se indholdet — vedhæft filen ovenfor, eller beskriv den i noten.
