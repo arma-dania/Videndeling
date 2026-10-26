@@ -6,6 +6,8 @@
 // Kaldes som:  /.netlify/functions/hent-side?url=https://eksempel.dk/side
 // Svarer med:  { titel, beskrivelse, tekst }
 
+import { adgangNægtet } from "../lib/adgang.mjs";
+
 const MAKS_TEGN = 15000;
 
 /* Simpel værn mod at endepunktet bruges til at nå interne adresser */
@@ -77,8 +79,11 @@ function tilTekst(html) {
 export default async (request) => {
   const svarhoved = {
     "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "public, max-age=3600",
+    "Cache-Control": "private, max-age=3600",
   };
+
+  const nægtet = adgangNægtet(request);
+  if (nægtet) return nægtet;
 
   const adresse = new URL(request.url).searchParams.get("url");
   if (!adresse) {
