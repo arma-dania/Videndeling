@@ -131,11 +131,6 @@ function knapTekst(link) {
   return `Åbn ${link.navn}${ER_M365.test(link.url) ? " i Teams" : ""}`;
 }
 
-/* Teams-links (teams.microsoft.com/l/…) åbner i browseren. Med msteams:
-   i stedet for https://teams.microsoft.com åbner de i Teams-appen. */
-const ER_TEAMS_LINK = /^https:\/\/teams\.microsoft\.com\/l\//i;
-const tilTeamsAppen = (url) => url.replace(/^https:\/\/teams\.microsoft\.com\//i, "msteams:/");
-
 /* Et opslag kan have flere links, fx slides og optagelse. De ligger i
    "links"; "url" er altid det første, så ældre opslag og søgning virker. */
 const linksFor = (post) =>
@@ -195,12 +190,15 @@ async function hentSideTekst(url) {
 /*  Læsning af vedhæftede filer                                        */
 /* ------------------------------------------------------------------ */
 
-/* En Netlify-funktion tager højst ca. 6 MB ind. Større PDF'er og alle
-   PowerPoint- og Word-filer læses derfor her i browseren, og kun teksten
-   sendes videre. Filen selv gemmes ingen steder — den bliver i Teams. */
+/* En Netlify-funktion tager højst ca. 6 MB ind og skal svare inden for 30
+   sekunder. PDF'er, PowerPoint- og Word-filer læses derfor her i browseren,
+   og kun teksten sendes videre. Filen selv gemmes ingen steder — den bliver
+   i Teams. */
 const MAKS_DIREKTE = 3.5 * 1024 * 1024;
-const MAKS_TEKST = 15000;
-const MAKS_SAMLET = 30000; // tekst fra flere filer tilsammen
+// Ca. 30.000 ord i alt — nok til en hel konference, og AI'en når at læse det
+const MAKS_SAMLET = 120000;
+const MAKS_SIDE = 10000; // tekst fra én webside
+const MAKS_INDSAT = 30000; // tekst, kollegaen selv har indsat
 
 const ER_PPTX = /\.pptx$/i;
 const ER_DOCX = /\.docx$/i;
@@ -216,12 +214,32 @@ function tekstFraXml(xml) {
     .join("\n");
 }
 
-async function udtrækOffice(fil) {
+/* Samler dele (dias eller sider) under et loft. Er der for meget, forkortes
+   hver del lige meget i stedet for at skære slutningen af — ellers ville de
+   sidste oplæg i en lang præsentation aldrig komme med. Korte dele beholdes
+   hele og giver deres overskud videre til de lange. */
+function tilpas(dele, loft) {
+  const samlet = dele.reduce((sum, d) => sum + d.length, 0);
+  if (samlet <= loft) return dele.join("\n\n");
+  const plads = [];
+  let rest = loft;
+  let tilbage = dele.length;
+  for (const [længde, i] of dele.map((d, i) => [d.length, i]).sort((a, b) => a[0] - b[0])) {
+    plads[i] = Math.min(længde, Math.floor(rest / tilbage));
+    rest -= plads[i];
+    tilbage--;
+  }
+  return dele.map((d, i) => (d.length > plads[i] ? `${d.slice(0, plads[i])}…` : d)).join("\n\n");
+}
+
+async function udtrækOffice(fil, loft) {
   const { default: JSZip } = await import("jszip");
   const zip = await JSZip.loadAsync(fil);
   const læs = (navn) => (zip.file(navn) ? zip.file(navn).async("string") : "");
 
-  if (ER_DOCX.test(fil.name)) return tekstFraXml(await læs("word/document.xml"));
+  if (ER_DOCX.test(fil.name)) {
+    return tilpas([tekstFraXml(await læs("word/document.xml"))], loft);
+  }
 
   // PowerPoint: diasene i rækkefølge, med talernoter hvor de findes
   const nr = (navn) => Number((navn.match(/(\d+)\.xml$/) || [])[1] || 0);
@@ -237,33 +255,40 @@ async function udtrækOffice(fil) {
     if (tekst || noter) {
       dele.push(`Dias ${i + 1}:\n${tekst}${noter ? `\nNoter: ${noter}` : ""}`);
     }
-    if (dele.join("").length > MAKS_TEKST) break;
   }
-  return dele.join("\n\n");
+  return tilpas(dele, loft);
 }
 
-async function udtrækPdf(fil) {
+async function udtrækPdf(fil, loft) {
   const pdfjs = await import("pdfjs-dist");
   const { default: arbejder } = await import("pdfjs-dist/build/pdf.worker.min.mjs?url");
   pdfjs.GlobalWorkerOptions.workerSrc = arbejder;
   const pdf = await pdfjs.getDocument({ data: await fil.arrayBuffer() }).promise;
-  const sider = [];
+  const dele = [];
   for (let i = 1; i <= pdf.numPages; i++) {
     const indhold = await (await pdf.getPage(i)).getTextContent();
-    sider.push(indhold.items.map((x) => x.str).join(" "));
-    if (sider.join("").length > MAKS_TEKST) break;
+    const tekst = indhold.items
+      .map((x) => x.str)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (tekst) dele.push(`Side ${i}: ${tekst}`);
   }
-  return sider.join("\n");
+  return tilpas(dele, loft);
 }
 
 /* Svarer enten { tekst } (udtrukket her) eller { blok } (sendes som fil til AI'en).
-   "plads" er, hvor meget der er tilbage af de ca. 3,5 MB, der kan sendes som fil. */
-async function læsFil(fil, plads = MAKS_DIREKTE) {
+   "plads" er, hvor meget der er tilbage af de ca. 3,5 MB, der kan sendes som
+   fil, og "loft" er, hvor mange tegn teksten fra denne fil må fylde. */
+async function læsFil(fil, plads, loft) {
   if (ER_PPTX.test(fil.name) || ER_DOCX.test(fil.name)) {
-    return { tekst: (await udtrækOffice(fil)).slice(0, MAKS_TEKST) };
+    return { tekst: await udtrækOffice(fil, loft) };
   }
   if (fil.type === "application/pdf") {
-    if (fil.size > plads) return { tekst: (await udtrækPdf(fil)).slice(0, MAKS_TEKST) };
+    // Teksten er hurtigere og billigere for AI'en end selve PDF'en. Kun en
+    // scannet PDF uden tekst sendes som fil, så AI'en kan se siderne.
+    const tekst = await udtrækPdf(fil, loft);
+    if (tekst.length > 200 || fil.size > plads) return { tekst };
     const data = await læsSomBase64(fil);
     return { blok: { type: "document", source: { type: "base64", media_type: fil.type, data } } };
   }
@@ -314,7 +339,10 @@ async function spørgClaude(indhold, brugWebsøgning) {
     // Gem serverens egen forklaring, fx at API-nøglen mangler, så den kan vises
     const fejl = new Error(`AI-fejl ${svar.status}`);
     fejl.detalje =
-      (data && (data.fejl || (data.error && data.error.message))) || `status ${svar.status}`;
+      (data && (data.fejl || (data.error && data.error.message))) ||
+      (svar.status === 502 || svar.status === 504
+        ? "AI'en nåede ikke at blive færdig inden for tidsgrænsen på 30 sekunder. Prøv igen, eller vedhæft færre filer"
+        : `status ${svar.status}`);
     throw fejl;
   }
   if (!data || !Array.isArray(data.content)) throw new Error("Uventet svar");
@@ -529,7 +557,7 @@ const STIL = `
 .vd-titel a { color:inherit; text-decoration:none; background-image:linear-gradient(currentColor,currentColor);
   background-size:0% 1.5px; background-repeat:no-repeat; background-position:0 100%; transition:background-size .2s; }
 .vd-titel a:hover { background-size:100% 1.5px; }
-.vd-resume { color:#40383D; font-size:14.5px; margin:0; }
+.vd-resume { color:#40383D; font-size:14.5px; margin:0; white-space:pre-line; }
 .vd-resume.vd-klip { display:-webkit-box; -webkit-line-clamp:5; -webkit-box-orient:vertical; overflow:hidden; }
 .vd-fold { display:flex; align-items:center; justify-content:center; width:100%;
   margin-top:9px; padding:9px 0 5px; border-top:1px solid var(--linje); color:var(--graa); }
@@ -588,9 +616,7 @@ textarea.vd-lang { min-height:150px; font-size:14px; }
   background:var(--rod-lys); color:var(--rod-dyb); font-size:13.5px; font-weight:600; text-decoration:none; }
 .vd-aabn:hover { background:#F6DDE1; }
 .vd-links { display:flex; flex-wrap:wrap; gap:8px 10px; align-items:center; margin-top:12px; }
-.vd-teamslink { display:inline-flex; align-items:baseline; gap:8px; }
-.vd-browser { font-size:12px; color:var(--graa); text-decoration:underline; text-underline-offset:3px; }
-.vd-browser:hover { color:var(--rod); }
+.vd-nyfane { font-size:13px; color:var(--graa); }
 .vd-linkrække { display:flex; gap:8px; margin-bottom:8px; }
 .vd-linkurl { flex:2 1 0; min-width:0; }
 .vd-linknavn { flex:1 1 0; min-width:0; }
@@ -675,28 +701,6 @@ function Pil() {
   );
 }
 
-/* Et link, der åbner i Teams-appen, hvis det er et Teams-link — med en lille
-   reserve til browseren, fx på en computer uden appen */
-function TeamsLink({ url, className, children }) {
-  if (!ER_TEAMS_LINK.test(url)) {
-    return (
-      <a className={className} href={url} target="_blank" rel="noopener noreferrer">
-        {children}
-      </a>
-    );
-  }
-  return (
-    <span className="vd-teamslink">
-      <a className={className} href={tilTeamsAppen(url)}>
-        {children}
-      </a>
-      <a className="vd-browser" href={url} target="_blank" rel="noopener noreferrer">
-        eller i browseren
-      </a>
-    </span>
-  );
-}
-
 /* Knapperne på kortet — én pr. link */
 function LinkKnapper({ links }) {
   const gyldige = links.filter((l) => erWebadresse(l.url));
@@ -704,9 +708,16 @@ function LinkKnapper({ links }) {
   return (
     <div className="vd-links">
       {gyldige.map((l, i) => (
-        <TeamsLink key={i} url={l.url} className="vd-aabn">
+        <a
+          key={i}
+          className="vd-aabn"
+          href={l.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          title="Åbner i en ny fane"
+        >
           {knapTekst(l)} <span aria-hidden="true">↗</span>
-        </TeamsLink>
+        </a>
       ))}
     </div>
   );
@@ -1091,16 +1102,42 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
       );
     }
 
-    /* Vedhæftede filer læses først. PowerPoint, Word og store PDF'er bliver
-       til tekst her i browseren; små PDF'er og billeder sendes som fil, så
-       længe de tilsammen holder sig under grænsen for ét kald. */
-    const filTekster = [];
+    /* Offentlige links (fx programmet for en konference) hentes altid med —
+       også når der er vedhæftet filer. YouTube har sin egen titelopslag. */
+    const ytLink = liste.find((l) => ER_YOUTUBE.test(l.url));
+    const [yt, ...hentede] = await Promise.all([
+      ytLink ? hentYouTubeInfo(ytLink.url) : null,
+      ...liste
+        .filter((l) => !BAG_LOGIN.test(l.url) && !ER_YOUTUBE.test(l.url))
+        .slice(0, 3)
+        .map(async (l) => ({ link: l, side: await hentSideTekst(l.url) })),
+    ]);
+    const sider = hentede.filter((h) => h.side);
+    const side = sider.length ? sider[0].side : null;
+
+    /* Afsnit med tekst til AI'en. Websider og indsat tekst får fast plads;
+       filerne deler resten af loftet ligeligt. */
+    const afsnit = [];
+    const indsat = transskription.trim().slice(0, MAKS_INDSAT);
+    if (indsat) afsnit.push({ overskrift: "Tekst, kollegaen har indsat", tekst: indsat });
+    for (const { link, side: s } of sider) {
+      afsnit.push({
+        overskrift: `Webside${link.navn ? ` (${link.navn})` : ""}: ${s.titel || link.url} — ${link.url}`,
+        tekst: s.tekst.slice(0, MAKS_SIDE),
+      });
+    }
+    const brugt = afsnit.reduce((sum, a) => sum + a.tekst.length, 0);
+    const filLoft = Math.floor(Math.max(MAKS_SAMLET - brugt, 20000) / Math.max(filer.length, 1));
+
+    /* Vedhæftede filer bliver til tekst her i browseren. Kun billeder og
+       scannede PDF'er sendes som fil, så længe de tilsammen holder sig under
+       grænsen for ét kald. */
     const filBlokke = [];
     let plads = MAKS_DIREKTE;
     for (const fil of filer) {
       let læst;
       try {
-        læst = await læsFil(fil, plads);
+        læst = await læsFil(fil, plads, filLoft);
       } catch (e) {
         setArbejder(false);
         return setFejl(
@@ -1114,7 +1151,7 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
         filBlokke.push(læst.blok);
         plads -= fil.size;
       } else if (tekst) {
-        filTekster.push(filer.length > 1 ? `Fra ${fil.name}:\n${tekst}` : tekst);
+        afsnit.push({ overskrift: `Vedhæftet fil: ${fil.name}`, tekst });
       } else {
         setArbejder(false);
         return setFejl(
@@ -1122,40 +1159,20 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
         );
       }
     }
-    const filTekst = filTekster.join("\n\n");
-    const filnavne = filer.map((f) => f.name).join(", ");
+    const tekstKilde = afsnit
+      .map((a) => `=== ${a.overskrift} ===\n${a.tekst}`)
+      .join("\n\n");
 
-    let tekstKilde = [transskription.trim(), filTekst]
-      .filter(Boolean)
-      .join("\n\n")
-      .slice(0, MAKS_SAMLET);
-    const ytLink = liste.find((l) => ER_YOUTUBE.test(l.url));
-    const yt = ytLink ? await hentYouTubeInfo(ytLink.url) : null;
-
-    /* Er der hverken fil eller indsat tekst, så prøv at hente det første
-       offentlige link på serveren */
-    let side = null;
-    if (!filBlokke.length && !tekstKilde && offentligt) {
-      side = await hentSideTekst(offentligt.url);
-      if (side) tekstKilde = side.tekst.slice(0, 12000);
-    }
-
-    const flere = filer.length > 1;
-    const kilde = filBlokke.length
-      ? `Kollegaen har vedhæftet ${flere ? "filerne" : "selve filen"} (${filnavne})${
-          filTekst ? ", og teksten fra nogle af dem står nedenfor" : ""
-        }. Byg titel, fagområde og opsummering på det faktiske indhold.`
-      : filTekst
-      ? `Nedenfor står teksten fra ${flere ? "de vedhæftede filer" : "den vedhæftede fil"} (${filnavne})${
-          transskription.trim() ? " og den tekst, kollegaen har indsat" : ""
-        }. Byg titel, fagområde og opsummering på den. Søg ikke.`
-      : side
-      ? `Nedenfor står teksten fra kilden. Byg opsummeringen på den — det er dit primære grundlag. Søg ikke. Teksten er hentet råt fra en webside, så se bort fra menupunkter, cookiebeskeder, kontaktoplysninger og gentagelser.`
-      : tekstKilde
-      ? `Nedenfor står tekst, som kollegaen har indsat fra kilden, fx en transskription. Byg opsummeringen på den — det er dit primære grundlag. Søg ikke.`
-      : bagLogin
-      ? `Linkene peger på filer bag skolens login, som du ikke kan åbne. Søg ikke, og find aldrig på indhold. Byg titel og opsummering på kollegaens note, og indled opsummeringen med "Kunne ikke læses automatisk."`
-      : `Slå ${offentligt.url} op på nettet, hvis siden er offentligt tilgængelig. Søg højst én gang. Kan du ikke komme ind — fordi siden kræver login, eller fordi indholdet er en video eller podcast, du hverken kan se eller høre — så find aldrig på indhold. Skriv i stedet en opsummering, der bygger på kollegaens note, og indled den med "Kunne ikke læses automatisk."`;
+    const kilde =
+      filBlokke.length || afsnit.length
+        ? `Nedenfor${filBlokke.length ? " og i de vedhæftede filer" : ""} står indholdet fra kilderne. Brug dem alle sammen — et program fortæller fx, hvem der talte om hvad, mens slides giver indholdet. Byg titel, fagområde og opsummering på det, der faktisk står. Søg ikke.${
+            sider.length
+              ? " Tekst fra websider er hentet råt, så se bort fra menupunkter, cookiebeskeder, kontaktoplysninger og gentagelser."
+              : ""
+          }`
+        : bagLogin
+        ? `Linkene peger på filer bag skolens login, som du ikke kan åbne. Søg ikke, og find aldrig på indhold. Byg titel og opsummering på kollegaens note, og indled opsummeringen med "Kunne ikke læses automatisk."`
+        : `Slå ${offentligt.url} op på nettet, hvis siden er offentligt tilgængelig. Søg højst én gang. Kan du ikke komme ind — fordi siden kræver login, eller fordi indholdet er en video eller podcast, du hverken kan se eller høre — så find aldrig på indhold. Skriv i stedet en opsummering, der bygger på kollegaens note, og indled den med "Kunne ikke læses automatisk."`;
     const linkliste = liste
       .map((l, i) => {
         const format = filformat(l.url);
@@ -1168,18 +1185,18 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
 
 ${liste.length > 1 ? "Links" : "Link"}:
 ${linkliste}${
-      yt
-        ? `\nVideoens rigtige titel: "${yt.titel}"${yt.kanal ? ` (kanal: ${yt.kanal})` : ""}`
-        : side && side.titel
-        ? `\nSidens egen titel: "${side.titel}"`
-        : ""
+      yt ? `\nVideoens rigtige titel: "${yt.titel}"${yt.kanal ? ` (kanal: ${yt.kanal})` : ""}` : ""
     }
 Kollegaens egen note: ${note.trim() || "(ingen)"}
 
 ${kilde}
-${tekstKilde ? `\nTekst fra kilden:\n"""\n${tekstKilde}\n"""\n` : ""}
+${tekstKilde ? `\nKilder:\n"""\n${tekstKilde}\n"""\n` : ""}
+Opsummeringen skal stå mål med materialet:
+- En enkelt artikel, video eller kort tekst: 2-3 sætninger.
+- Omfattende materiale, fx en konference, mange slides eller flere oplæg: én indledende sætning, derefter én linje pr. oplæg eller hovedtema, der begynder med "• " og nævner oplægsholder eller organisation og de vigtigste pointer og tal (højst 12 linjer), og til sidst én sætning om, hvad det kan bruges til i undervisningen. Adskil linjerne med \\n.
+
 Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen markdown:
-{"titel":"kort sigende titel på dansk, max 12 ord","kategori":"et af: ${FAGLISTE}","type":"et af: ${TYPER.join(", ")}","opsummering":"2-3 sætninger på dansk i almindeligt sprog, der fortæller en underviser hvad det handler om, og hvad det kan bruges til"}`;
+{"titel":"kort sigende titel på dansk, max 12 ord","kategori":"et af: ${FAGLISTE}","type":"et af: ${TYPER.join(", ")}","opsummering":"på dansk i almindeligt sprog, som beskrevet ovenfor"}`;
 
     try {
       const indhold = filBlokke.length ? [...filBlokke, { type: "text", text: opgave }] : opgave;
@@ -1314,7 +1331,10 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
         fx slides og optagelse, så tilføj et link til hver.
         {TEAMS_MAPPE && (
           <div style={{ marginTop: 8 }}>
-            <TeamsLink url={TEAMS_MAPPE}>Åbn mappen i Teams ↗</TeamsLink>
+            <a href={TEAMS_MAPPE} target="_blank" rel="noopener noreferrer">
+              Åbn mappen i Teams ↗
+            </a>{" "}
+            <span className="vd-nyfane">(åbner i en ny fane, så denne side bliver stående)</span>
           </div>
         )}
       </div>
@@ -1607,7 +1627,7 @@ export default function Vidensdeling() {
       kategori: p.kategori,
       navn: p.navn,
       dato: p.dato,
-      opsummering: (p.opsummering || "").slice(0, 400),
+      opsummering: (p.opsummering || "").slice(0, 800),
     }));
     const prompt = `Du er søgefunktion i et videndelingskatalog for undervisere på en dansk markedsføringsøkonom-uddannelse.
 
