@@ -4,20 +4,15 @@
 // Nøglen sættes i Netlify under Site configuration → Environment variables
 // som ANTHROPIC_API_KEY. Den må aldrig stå i koden eller i repoet.
 //
-// Det væsentlige: HELE anmodningen sendes videre — også "tools".
-// Uden den parameter kan modellen ikke søge på nettet.
+// Model, loft over svarlængde og værktøjer bestemmes her på serveren —
+// ikke af browseren — så endepunktet ikke kan bruges til hvad som helst
+// på jeres regning. Det eneste værktøj, browseren kan bede om, er websøgning.
 
-const TILLADTE_FELTER = [
-  "model",
-  "max_tokens",
-  "messages",
-  "system",
-  "temperature",
-  "tools",
-  "tool_choice",
-  "mcp_servers",
-  "stop_sequences",
-];
+import { adgangNægtet } from "../lib/adgang.mjs";
+
+const MODEL = "claude-sonnet-4-6";
+const MAKS_TOKENS = 1500;
+const WEBSØGNING = { type: "web_search_20250305", name: "web_search", max_uses: 3 };
 
 export default async (request) => {
   const svarhoved = { "Content-Type": "application/json; charset=utf-8" };
@@ -28,6 +23,9 @@ export default async (request) => {
       headers: svarhoved,
     });
   }
+
+  const nægtet = adgangNægtet(request);
+  if (nægtet) return nægtet;
 
   const nøgle = process.env.ANTHROPIC_API_KEY;
   if (!nøgle) {
@@ -49,13 +47,23 @@ export default async (request) => {
     });
   }
 
-  // Kopiér kun kendte felter videre — men kopiér dem alle sammen
-  const krop = {};
-  for (const felt of TILLADTE_FELTER) {
-    if (indkommet[felt] !== undefined) krop[felt] = indkommet[felt];
+  if (!Array.isArray(indkommet.messages) || indkommet.messages.length === 0) {
+    return new Response(JSON.stringify({ fejl: "Mangler messages" }), {
+      status: 400,
+      headers: svarhoved,
+    });
   }
-  if (!krop.model) krop.model = "claude-sonnet-4-6";
-  if (!krop.max_tokens) krop.max_tokens = 1500;
+
+  const ønsket = Number(indkommet.max_tokens) || 1000;
+  const krop = {
+    model: MODEL,
+    max_tokens: Math.min(Math.max(ønsket, 1), MAKS_TOKENS),
+    messages: indkommet.messages,
+  };
+  const vilSøge =
+    Array.isArray(indkommet.tools) &&
+    indkommet.tools.some((t) => t && String(t.type || "").startsWith("web_search"));
+  if (vilSøge) krop.tools = [WEBSØGNING];
 
   try {
     const svar = await fetch("https://api.anthropic.com/v1/messages", {

@@ -40,10 +40,13 @@ komponent-kode kan genbruges næsten uændret.
 vidensdelings-komponent. De to ting, der plejede at kræve Claudes eget
 miljø, er koblet om til jeres egne funktioner:
 
-- `spørgClaude(...)` kalder nu `/.netlify/functions/ask-claude` i stedet
-  for Anthropic direkte.
-- `hentData()` / `gemData()` kalder nu `/.netlify/functions/storage` i
-  stedet for `window.storage`.
+- `spørgClaude(...)` kalder nu `/.netlify/functions/ai` i stedet
+  for Anthropic direkte. Model og loft over svarlængde bestemmes i
+  funktionen, ikke i browseren.
+- `hentData()` / `gemData()` kalder nu `/.netlify/functions/lager` (via
+  `src/lager.js`) i stedet for `window.storage`.
+- `/.netlify/functions/hent-side` henter offentlige websider, så AI'en kan
+  opsummere dem.
 
 Resten af filen — design, komponenter, formular, søgning — er uændret.
 Skal I redigere siden videre herfra, kan I roligt bygge oven på det, der
@@ -65,8 +68,14 @@ står i `src/App.jsx`.
 2. Tilføj en ny variabel:
    - **Key:** `ANTHROPIC_API_KEY`
    - **Value:** nøglen fra Trin 1
-3. Gå til **Deploys** og vælg **Trigger deploy → Deploy site**, så
-   ændringen slår igennem.
+3. Tilføj også en fælles adgangskode, som I deler med kollegerne:
+   - **Key:** `VIDENDELING_KODE`
+   - **Value:** en kode efter eget valg
+   Uden den kan alle, der kender adressen, læse og slette opslag og bruge
+   jeres API-nøgle. Med den beder siden om koden første gang, den åbnes i en
+   browser, og husker den derefter.
+4. Gå til **Deploys** og vælg **Trigger deploy → Deploy site**, så
+   ændringerne slår igennem.
 
 ## Trin 6 — Test siden
 
@@ -95,7 +104,9 @@ iframe uden yderligere opsætning — I skal blot undgå selv at tilføje en
 
 - Enhver ændring, I committer til GitHub-repositoryet, bygges og udgives
   automatisk af Netlify.
-- Netlify Blobs (databasen) og de to funktioner er inkluderet i Netlifys
+- Skal adgangskoden skiftes, så ret `VIDENDELING_KODE` og udgiv siden igen.
+  Kollegerne bliver så bedt om den nye kode.
+- Netlify Blobs (databasen) og funktionerne er inkluderet i Netlifys
   gratis niveau ved almindeligt brug i et internt team.
 - Overvåg jeres API-forbrug på console.anthropic.com, hvis brugen vokser
   markant.

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { storage } from "./lager.js";
+import { storage, adgangshoveder, gemKode, hentKode } from "./lager.js";
 /* ------------------------------------------------------------------ */
 /*  Data og konstanter                                                 */
 /* ------------------------------------------------------------------ */
@@ -63,6 +63,25 @@ function gætType(url) {
   return "Dokument";
 }
 
+/* Kun almindelige webadresser må gemmes og vises som link — ellers kunne et
+   "javascript:"-link køre kode hos den kollega, der klikker på det */
+function erWebadresse(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/* "www.dr.dk" bliver til "https://www.dr.dk"; alt andet røres ikke */
+function normaliserUrl(url) {
+  const u = (url || "").trim();
+  return u && !/^[a-z][a-z0-9+.-]*:/i.test(u) ? `https://${u}` : u;
+}
+
+const URLFEJL = "Linket skal være en webadresse, der begynder med https:// eller http://.";
+
 function pænUrl(url) {
   try {
     return new URL(url).hostname.replace(/^www\./, "");
@@ -96,7 +115,8 @@ async function hentYouTubeInfo(url) {
 async function hentSideTekst(url) {
   try {
     const svar = await fetch(
-      `/.netlify/functions/hent-side?url=${encodeURIComponent(url)}`
+      `/.netlify/functions/hent-side?url=${encodeURIComponent(url)}`,
+      { headers: adgangshoveder() }
     );
     if (!svar.ok) return null;
     const d = await svar.json();
@@ -131,8 +151,8 @@ function udtrækJson(tekst) {
 }
 
 async function spørgClaude(indhold, brugWebsøgning) {
+  // Model og loft over svarlængde bestemmes af serveren (netlify/functions/ai.mjs)
   const body = {
-    model: "claude-sonnet-4-6",
     max_tokens: 1000,
     messages: [{ role: "user", content: indhold }],
   };
@@ -141,9 +161,10 @@ async function spørgClaude(indhold, brugWebsøgning) {
   }
   const svar = await fetch("/.netlify/functions/ai", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...adgangshoveder() },
     body: JSON.stringify(body),
   });
+  if (!svar.ok) throw new Error(`AI-fejl ${svar.status}`);
   const data = await svar.json();
   if (!data || !Array.isArray(data.content)) throw new Error("Uventet svar");
   return data.content
@@ -169,8 +190,11 @@ async function hentData() {
         navne: d.navne && d.navne.length ? d.navne : STANDARDNAVNE,
       };
     }
-  } catch {
-    /* nøglen findes ikke endnu */
+  } catch (e) {
+    /* Findes nøglen ikke endnu, er kataloget bare tomt. Alle andre fejl
+       sendes videre — ellers ville gemData() overskrive hele kataloget
+       med en tom liste, hvis lageret var midlertidigt utilgængeligt. */
+    if (!e.fandtesIkke) throw e;
   }
   return { opslag: [], navne: STANDARDNAVNE };
 }
@@ -198,7 +222,7 @@ const STIL = `
       font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
       font-size:16px; line-height:1.55; }
 .vd *,.vd *::before,.vd *::after { box-sizing:border-box; }
-.vd button { font:inherit; cursor:pointer; border:none; background:none; color:inherit; }
+:where(.vd) button { font:inherit; cursor:pointer; border:none; background:none; color:inherit; }
 .vd input,.vd select,.vd textarea { font:inherit; color:inherit; }
 .vd :focus-visible { outline:2px solid var(--rod); outline-offset:2px; border-radius:2px; }
 
@@ -383,6 +407,7 @@ function Opslag({ post, begrundelse, navne, onSlet, onRet }) {
   const [udkast, setUdkast] = useState(null);
   const [åben, setÅben] = useState(false);
   const [kanFoldes, setKanFoldes] = useState(false);
+  const [retfejl, setRetfejl] = useState("");
   const førsteFelt = useRef(null);
   const resumeRef = useRef(null);
 
@@ -486,17 +511,27 @@ function Opslag({ post, begrundelse, navne, onSlet, onRet }) {
               onChange={(e) => setUdkast({ ...udkast, url: e.target.value })}
             />
           </label>
+          {retfejl && <div className="vd-fejl">{retfejl}</div>}
           <div className="vd-handling" style={{ marginTop: 4 }}>
             <button
               className="vd-knap"
               onClick={() => {
-                onRet({ ...post, ...udkast });
+                const link = normaliserUrl(udkast.url);
+                if (!erWebadresse(link)) return setRetfejl(URLFEJL);
+                setRetfejl("");
+                onRet({ ...post, ...udkast, url: link });
                 setUdkast(null);
               }}
             >
               Gem ændringer
             </button>
-            <button className="vd-annuller" onClick={() => setUdkast(null)}>
+            <button
+              className="vd-annuller"
+              onClick={() => {
+                setRetfejl("");
+                setUdkast(null);
+              }}
+            >
               Fortryd
             </button>
           </div>
@@ -513,7 +548,11 @@ function Opslag({ post, begrundelse, navne, onSlet, onRet }) {
         <span className="n">{post.navn}</span>
       </div>
       <h3 className="vd-titel">
-        <a href={post.url} target="_blank" rel="noopener noreferrer">
+        <a
+          href={erWebadresse(post.url) ? post.url : undefined}
+          target="_blank"
+          rel="noopener noreferrer"
+        >
           {post.titel}
         </a>
       </h3>
@@ -577,6 +616,65 @@ function Opslag({ post, begrundelse, navne, onSlet, onRet }) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  Adgangskode                                                        */
+/* ------------------------------------------------------------------ */
+
+function Adgangskode({ forkert, onIndsend }) {
+  const [kode, setKode] = useState("");
+  const [arbejder, setArbejder] = useState(false);
+  const [udfald, setUdfald] = useState(forkert ? "forkert" : "");
+
+  return (
+    <form
+      className="vd-form"
+      onSubmit={async (e) => {
+        e.preventDefault();
+        if (!kode.trim()) return;
+        setArbejder(true);
+        const svar = await onIndsend(kode.trim());
+        if (svar !== "ok") {
+          setUdfald(svar);
+          setArbejder(false);
+        }
+      }}
+    >
+      <h2 className="vd-display">Skriv adgangskoden</h2>
+      <p className="intro">
+        Kataloget er kun for kolleger. Koden huskes i denne browser, så du skal kun skrive
+        den én gang.
+      </p>
+      {udfald && !arbejder && (
+        <div className="vd-fejl" role="alert">
+          {udfald === "forkert"
+            ? "Koden passede ikke. Prøv igen, eller spørg en kollega."
+            : "Serveren svarede ikke. Prøv igen om lidt."}
+        </div>
+      )}
+      <label className="vd-mark">
+        <span>Adgangskode</span>
+        <input
+          type="password"
+          className="vd-input"
+          autoComplete="current-password"
+          autoFocus
+          value={kode}
+          onChange={(e) => setKode(e.target.value)}
+        />
+      </label>
+      <div className="vd-handling">
+        {arbejder ? (
+          <Status tekst="Tjekker koden…" />
+        ) : (
+          <button type="submit" className="vd-knap">
+            Åbn kataloget
+          </button>
+        )}
+      </div>
+    </form>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  Formular                                                           */
 /* ------------------------------------------------------------------ */
 
@@ -610,16 +708,19 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
   async function analyser() {
     setFejl("");
     if (!url.trim()) return setFejl("Indsæt et link til det, du vil dele.");
+    const link = normaliserUrl(url);
+    if (!erWebadresse(link)) return setFejl(URLFEJL);
+    if (link !== url) setUrl(link);
     if (!navn) return setFejl("Vælg dit navn på listen.");
     setArbejder(true);
 
     let tekstKilde = transskription.trim().slice(0, 12000);
-    const yt = await hentYouTubeInfo(url.trim());
+    const yt = await hentYouTubeInfo(link);
 
     /* Er der hverken fil eller indsat tekst, så prøv at hente siden på serveren */
     let side = null;
-    if (!fil && !tekstKilde && !BAG_LOGIN.test(url)) {
-      side = await hentSideTekst(url.trim());
+    if (!fil && !tekstKilde && !BAG_LOGIN.test(link)) {
+      side = await hentSideTekst(link);
       if (side) tekstKilde = side.tekst.slice(0, 12000);
     }
 
@@ -631,7 +732,7 @@ function Formular({ navne, onGem, onAnnuller, onNytNavn }) {
 
     const opgave = `Du hjælper undervisere på Markedsføringsøkonom-uddannelsen på et dansk erhvervsakademi med at katalogisere delt viden.
 
-Link: ${url.trim()}${
+Link: ${link}${
       yt
         ? `\nKildens rigtige titel: "${yt.titel}"${yt.kanal ? ` (kanal: ${yt.kanal})` : ""}`
         : side && side.titel
@@ -671,11 +772,11 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
       }
       j = j || {};
       setUdkast({
-        titel: j.titel || (yt && yt.titel) || (side && side.titel) || pænUrl(url),
+        titel: j.titel || (yt && yt.titel) || (side && side.titel) || pænUrl(link),
         kategori: FAGOMRAADER.some((f) => f.navn === j.kategori)
           ? j.kategori
           : "Markedsføring",
-        type: TYPER.includes(j.type) ? j.type : gætType(url),
+        type: TYPER.includes(j.type) ? j.type : gætType(link),
         opsummering: j.opsummering || note.trim() || "",
       });
       if (!j.opsummering) {
@@ -685,9 +786,9 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
       }
     } catch {
       setUdkast({
-        titel: (yt && yt.titel) || pænUrl(url),
+        titel: (yt && yt.titel) || pænUrl(link),
         kategori: "Markedsføring",
-        type: gætType(url),
+        type: gætType(link),
         opsummering: note.trim() || "",
       });
       setFejl("AI'en kunne ikke læse kilden. Skriv selv titel og opsummering nedenfor.");
@@ -754,7 +855,7 @@ Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen m
             onClick={() =>
               onGem({
                 id: `p${Date.now()}${Math.floor(Math.random() * 999)}`,
-                url: url.trim(),
+                url: normaliserUrl(url),
                 navn,
                 dato,
                 ...udkast,
@@ -943,35 +1044,67 @@ export default function Vidensdeling() {
   const [søger, setSøger] = useState(false);
   const [resultat, setResultat] = useState(null);
   const [søgefejl, setSøgefejl] = useState("");
+  const [låst, setLåst] = useState(false);
+  const [lagerfejl, setLagerfejl] = useState("");
+
+  /* 401 betyder, at serveren kræver den fælles adgangskode */
+  const håndterLagerfejl = (e, tekst) => {
+    if (e && e.status === 401) setLåst(true);
+    else setLagerfejl(tekst);
+  };
+
+  /* Svarer "ok", "forkert" (forkert kode) eller "fejl" */
+  const indlæs = () =>
+    hentData()
+      .then((d) => {
+        setData(d);
+        setKlar(true);
+        setLåst(false);
+        setLagerfejl("");
+        return "ok";
+      })
+      .catch((e) => {
+        håndterLagerfejl(e, "Opslagene kunne ikke hentes. Prøv at genindlæse siden om lidt.");
+        return e && e.status === 401 ? "forkert" : "fejl";
+      });
 
   useEffect(() => {
-    hentData().then((d) => {
-      setData(d);
-      setKlar(true);
-    });
+    indlæs();
   }, []);
 
-  const opdater = async (fn) => setData(await gemData(fn));
+  /* Returnerer true, hvis ændringen blev gemt */
+  const opdater = async (fn) => {
+    try {
+      setData(await gemData(fn));
+      setLagerfejl("");
+      return true;
+    } catch (e) {
+      håndterLagerfejl(e, "Ændringen kunne ikke gemmes. Prøv igen om lidt.");
+      return false;
+    }
+  };
 
   const tilføjOpslag = async (post) => {
-    await opdater((d) => ({ ...d, opslag: [post, ...d.opslag] }));
+    if (!(await opdater((d) => ({ ...d, opslag: [post, ...d.opslag] })))) return;
     setVisning("liste");
     setResultat(null);
     setSøgning("");
   };
 
   const retOpslag = async (post) => {
-    await opdater((d) => ({
+    const gemt = await opdater((d) => ({
       ...d,
       opslag: d.opslag.map((p) => (p.id === post.id ? { ...p, ...post } : p)),
     }));
+    if (!gemt) return;
     setResultat((r) =>
       r ? r.map((x) => (x.id === post.id ? { ...x, ...post } : x)) : r
     );
   };
 
   const sletOpslag = async (id) => {
-    await opdater((d) => ({ ...d, opslag: d.opslag.filter((p) => p.id !== id) }));
+    if (!(await opdater((d) => ({ ...d, opslag: d.opslag.filter((p) => p.id !== id) }))))
+      return;
     setResultat((r) => (r ? r.filter((x) => x.id !== id) : r));
   };
 
@@ -1063,7 +1196,7 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
             Vidensdeling
             <span>Markedsføringsøkonom</span>
           </h1>
-          {visning === "liste" && (
+          {visning === "liste" && !låst && (
             <button className="vd-del" onClick={() => setVisning("ny")}>
               + Del ny viden
             </button>
@@ -1072,7 +1205,20 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
       </header>
 
       <main className="vd-ind">
-        {visning === "ny" ? (
+        {lagerfejl && !låst && (
+          <div className="vd-fejl" role="alert" style={{ marginTop: 22, marginBottom: 0 }}>
+            {lagerfejl}
+          </div>
+        )}
+        {låst ? (
+          <Adgangskode
+            forkert={Boolean(hentKode())}
+            onIndsend={(k) => {
+              gemKode(k);
+              return indlæs();
+            }}
+          />
+        ) : visning === "ny" ? (
           <Formular
             navne={data.navne}
             onGem={tilføjOpslag}
@@ -1200,9 +1346,11 @@ Sortér med det mest relevante først. Højst 8 resultater.`;
             </div>
 
             {!klar ? (
-              <div style={{ padding: "50px 0" }}>
-                <Status tekst="Henter opslag…" />
-              </div>
+              !lagerfejl && (
+                <div style={{ padding: "50px 0" }}>
+                  <Status tekst="Henter opslag…" />
+                </div>
+              )
             ) : viste.length === 0 ? (
               <div className="vd-tom">
                 <h3>
