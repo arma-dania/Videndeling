@@ -79,6 +79,13 @@ export const storage = {
     return { key: noegle, deleted: true, shared: true };
   },
 
+  // Ikke en del af Claudes window.storage: henter alle værdier under et
+  // præfiks i ét kald. Svarer med { nøgle: værdi }.
+  async hentAlle(praefiks) {
+    const d = await kald({ handling: "alle", praefiks });
+    return d.vaerdier || {};
+  },
+
   async list(praefiks = "") {
     const d = await kald({ handling: "list", praefiks });
     return { keys: d.noegler || [], prefix: praefiks, shared: true };

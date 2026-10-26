@@ -40,7 +40,8 @@ export default async (request) => {
   const { handling, noegle, vaerdi, praefiks } = krop;
 
   const gyldig = (n) => typeof n === "string" && n.startsWith(NØGLEPRÆFIKS);
-  if (handling === "list" ? !gyldig(praefiks || NØGLEPRÆFIKS) : !gyldig(noegle)) {
+  const brugerPræfiks = handling === "list" || handling === "alle";
+  if (brugerPræfiks ? !gyldig(praefiks || NØGLEPRÆFIKS) : !gyldig(noegle)) {
     return new Response(JSON.stringify({ fejl: "Ugyldig nøgle" }), {
       status: 400,
       headers: svarhoved,
@@ -85,6 +86,19 @@ export default async (request) => {
       const { blobs } = await butik.list({ prefix: praefiks || NØGLEPRÆFIKS });
       return new Response(
         JSON.stringify({ noegler: (blobs || []).map((b) => b.key) }),
+        { status: 200, headers: svarhoved }
+      );
+    }
+
+    // Henter alle værdier under et præfiks i ét kald, så appen ikke skal
+    // lave ét kald pr. opslag, når siden åbnes
+    if (handling === "alle") {
+      const { blobs } = await butik.list({ prefix: praefiks || NØGLEPRÆFIKS });
+      const par = await Promise.all(
+        (blobs || []).map(async (b) => [b.key, await butik.get(b.key)])
+      );
+      return new Response(
+        JSON.stringify({ vaerdier: Object.fromEntries(par.filter(([, v]) => v != null)) }),
         { status: 200, headers: svarhoved }
       );
     }

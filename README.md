@@ -100,6 +100,25 @@ Netlify sætter ikke restriktive headers på siden, så den kan vises i en
 iframe uden yderligere opsætning — I skal blot undgå selv at tilføje en
 `X-Frame-Options`- eller CSP-header, der blokerer det.
 
+## Sådan gemmes data
+
+- Hvert opslag ligger under sin egen nøgle (`vidensdeling:opslag:<id>`) i
+  Netlify Blobs, og navnelisten under `vidensdeling:navne`. To kolleger,
+  der gemmer samtidig, overskriver derfor ikke hinandens ændringer.
+- Første version gemte hele kataloget under én nøgle (`vidensdeling:v1`).
+  Første gang den nye version åbnes, flyttes opslagene automatisk over, og
+  det gamle katalog gemmes som sikkerhedskopi under
+  `vidensdeling:kopi:v1:<tidspunkt>`.
+- Slettede opslag fjernes ikke, men markeres som slettede. Lige efter en
+  sletning kan man trykke **Fortryd**, og under **Slettede opslag** nederst
+  på siden kan de gendannes senere.
+
+## AI-modellen
+
+`netlify/functions/ai.mjs` bestemmer model (`claude-sonnet-5-5`), svarlængde
+og indsats (`effort: low`). Skal modellen skiftes, er det det eneste sted,
+den står.
+
 ## Løbende drift
 
 - Enhver ændring, I committer til GitHub-repositoryet, bygges og udgives
