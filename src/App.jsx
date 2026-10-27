@@ -19,13 +19,13 @@ const FAGOMRAADER = [
 
 const FAGLISTE = FAGOMRAADER.map((f) => f.navn).join(", ");
 
-const TYPER = ["Dokument", "Præsentation", "Podcast", "Video"];
+const TYPER = ["Dokument", "Præsentation", "Webside", "Podcast", "Video"];
 
 /* Link til kanalens "Videndeling"-mappe i Teams. Sættes i Netlify som
    miljøvariablen VITE_TEAMS_MAPPE; uden den vises vejledningen uden link. */
 const TEAMS_MAPPE = import.meta.env.VITE_TEAMS_MAPPE || "";
 
-/* Startliste — nye navne kan tilføjes i appen */
+/* Startliste. Navnelisten ligger derefter i databasen (vidensdeling:navne) */
 const STANDARDNAVNE = [
   "Allan",
   "Arne",
@@ -68,7 +68,9 @@ function gætType(url) {
   if (/youtube|youtu\.be|vimeo|\.mp4|video/.test(u)) return "Video";
   if (/spotify|podcast|soundcloud|apple\.com\/.*podcast|\.mp3|anchor\.fm/.test(u))
     return "Podcast";
-  return "Dokument";
+  // En fil (PDF, Word …) eller noget bag et login er et dokument; ellers en side på nettet
+  if (format || BAG_LOGIN.test(u)) return "Dokument";
+  return "Webside";
 }
 
 /* Kun almindelige webadresser må gemmes og vises som link — ellers kunne et
@@ -1202,6 +1204,8 @@ ${tekstKilde ? `\nKilder:\n"""\n${tekstKilde}\n"""\n` : ""}
 Opsummeringen skal stå mål med materialet:
 - En enkelt artikel, video eller kort tekst: 2-3 sætninger.
 - Omfattende materiale, fx en konference, mange slides eller flere oplæg: én indledende sætning, derefter én linje pr. oplæg eller hovedtema, der begynder med "• " og nævner oplægsholder eller organisation og de vigtigste pointer og tal (højst 12 linjer), og til sidst én sætning om, hvad det kan bruges til i undervisningen. Adskil linjerne med \\n.
+
+Typen: "Webside" er en artikel, blog eller anden side på nettet; "Dokument" er en fil som PDF eller Word; "Præsentation" er slides.
 
 Svar KUN med JSON. Skriv intet før og intet efter — ingen indledning, ingen markdown:
 {"titel":"kort sigende titel på dansk, max 12 ord","kategori":"et af: ${FAGLISTE}","type":"et af: ${TYPER.join(", ")}","opsummering":"på dansk i almindeligt sprog, som beskrevet ovenfor"}`;
